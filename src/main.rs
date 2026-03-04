@@ -31,6 +31,167 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vte::{Params, Perform, Parser};
 
 // -----------------------------------------------------------------------------
+// Theme (user-editable via config file)
+// -----------------------------------------------------------------------------
+
+/// Parses a hex color string "#rrggbb" or "rrggbb" into (r, g, b). Returns None if invalid.
+fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
+    let s = s.trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+const DEFAULT_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
+const DEFAULT_BG: (u8, u8, u8) = (0x1e, 0x1e, 0x1e);
+
+#[derive(Clone, Debug)]
+struct Theme {
+    default_foreground: (u8, u8, u8),
+    default_background: (u8, u8, u8),
+    background_opacity: f32,
+    font_size: u8,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            default_foreground: DEFAULT_FG,
+            default_background: DEFAULT_BG,
+            background_opacity: 0.95,
+            font_size: 14,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ThemeConfigFile {
+    #[serde(rename = "theme")]
+    theme: Option<ThemeSection>,
+}
+
+#[derive(serde::Deserialize)]
+struct ThemeSection {
+    default_foreground: Option<String>,
+    default_background: Option<String>,
+    background_opacity: Option<f32>,
+    font_size: Option<u8>,
+}
+
+fn load_theme() -> Theme {
+    let mut theme = Theme::default();
+    let config_path = match directories::ProjectDirs::from("", "", "chameleon") {
+        Some(dirs) => dirs.config_dir().join("config.toml"),
+        None => return theme,
+    };
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return theme,
+    };
+    let file_config: ThemeConfigFile = match toml::from_str(&contents) {
+        Ok(c) => c,
+        Err(_) => return theme,
+    };
+    let Some(section) = file_config.theme else {
+        return theme;
+    };
+    if let Some(ref s) = section.default_foreground {
+        if let Some(rgb) = parse_hex(s) {
+            theme.default_foreground = rgb;
+        }
+    }
+    if let Some(ref s) = section.default_background {
+        if let Some(rgb) = parse_hex(s) {
+            theme.default_background = rgb;
+        }
+    }
+    if let Some(o) = section.background_opacity {
+        theme.background_opacity = o.clamp(0.0, 1.0);
+    }
+    if let Some(f) = section.font_size {
+        theme.font_size = f.min(72).max(6);
+    }
+    theme
+}
+
+/// Returns the config file path for the theme (for opening in editor). May be None.
+fn theme_config_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "chameleon")
+        .map(|d| d.config_dir().join("config.toml"))
+}
+
+/// Default config content written when the file does not exist.
+const DEFAULT_CONFIG: &str = r##"# Chameleon theme — edit and save; press Ctrl+Shift+T to reopen this file.
+[theme]
+default_foreground = "#cccccc"
+default_background = "#1e1e1e"
+background_opacity = 0.95
+font_size = 14
+"##;
+
+/// Open the theme config file in $EDITOR, then reload theme into `theme`. Restores terminal state
+/// (alternate screen, raw mode) after the editor exits.
+fn open_theme_config_and_reload(
+    stdout: &mut io::Stdout,
+    theme: &Arc<Mutex<Theme>>,
+) -> io::Result<()> {
+    let config_path = match theme_config_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    // Restore normal terminal so the editor gets a usable TTY
+    execute!(
+        stdout,
+        event::DisableMouseCapture,
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    )?;
+    stdout.flush()?;
+    let _ = terminal::disable_raw_mode();
+
+    // Ensure config dir and default file exist
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        if !config_path.exists() {
+            let _ = std::fs::write(&config_path, DEFAULT_CONFIG);
+        }
+    }
+
+    let editor = std::env::var("EDITOR")
+        .unwrap_or_else(|_| std::env::var("VISUAL").unwrap_or_else(|_| "nano".to_string()));
+    let parts: Vec<&str> = editor.split_whitespace().collect();
+    let (bin, args) = parts
+        .split_first()
+        .map(|(b, rest)| (*b, rest))
+        .unwrap_or(("nano", &[][..]));
+    let mut cmd = std::process::Command::new(bin);
+    cmd.args(args).arg(&config_path);
+    let _ = cmd.status();
+
+    let _ = terminal::enable_raw_mode();
+    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+    let new_theme = load_theme();
+    if let Ok(mut t) = theme.lock() {
+        *t = new_theme;
+    }
+    execute!(stdout, terminal::Clear(ClearType::All))?;
+    if let Ok(t) = theme.lock() {
+        let (r, g, b) = t.default_background;
+        execute!(
+            stdout,
+            crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r, g, b })
+        )?;
+    }
+    execute!(stdout, event::EnableMouseCapture)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Screen buffer (shared between vte Perform and main thread)
 // -----------------------------------------------------------------------------
 
@@ -478,6 +639,7 @@ fn render(
     screen: &Screen,
     selection: Option<&Selection>,
     art_height: usize,
+    theme: &Theme,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     let (_term_rows, term_cols) = terminal::size()
@@ -527,11 +689,23 @@ fn render(
                     4 => crossterm::style::Color::DarkBlue,
                     5 => crossterm::style::Color::DarkMagenta,
                     6 => crossterm::style::Color::DarkCyan,
-                    7 => crossterm::style::Color::Grey,
-                    _ => crossterm::style::Color::Grey,
+                    7 => crossterm::style::Color::Rgb {
+                        r: theme.default_foreground.0,
+                        g: theme.default_foreground.1,
+                        b: theme.default_foreground.2,
+                    },
+                    _ => crossterm::style::Color::Rgb {
+                        r: theme.default_foreground.0,
+                        g: theme.default_foreground.1,
+                        b: theme.default_foreground.2,
+                    },
                 };
                 let bg = match cell.bg {
-                    0 => crossterm::style::Color::Black,
+                    0 => crossterm::style::Color::Rgb {
+                        r: theme.default_background.0,
+                        g: theme.default_background.1,
+                        b: theme.default_background.2,
+                    },
                     1 => crossterm::style::Color::DarkRed,
                     2 => crossterm::style::Color::DarkGreen,
                     3 => crossterm::style::Color::DarkYellow,
@@ -539,7 +713,11 @@ fn render(
                     5 => crossterm::style::Color::DarkMagenta,
                     6 => crossterm::style::Color::DarkCyan,
                     7 => crossterm::style::Color::Grey,
-                    _ => crossterm::style::Color::Black,
+                    _ => crossterm::style::Color::Rgb {
+                        r: theme.default_background.0,
+                        g: theme.default_background.1,
+                        b: theme.default_background.2,
+                    },
                 };
                 queue!(
                     stdout,
@@ -600,6 +778,8 @@ fn main() -> io::Result<()> {
     let rows = term_rows.saturating_sub(art_height).max(1);
     let cols = term_cols;
 
+    let theme = Arc::new(Mutex::new(load_theme()));
+
     let _guard = RawModeGuard::new()?;
     let mut stdout = io::stdout();
     execute!(
@@ -608,6 +788,14 @@ fn main() -> io::Result<()> {
         terminal::Clear(ClearType::All),
         cursor::Hide
     )?;
+    // Set default background from theme so cleared screen and empty cells use it
+    if let Ok(t) = theme.lock() {
+        let (r, g, b) = t.default_background;
+        execute!(
+            stdout,
+            crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb { r, g, b })
+        )?;
+    }
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -699,6 +887,15 @@ fn main() -> io::Result<()> {
                         continue;
                     }
 
+                    // Ctrl+Shift+T: open theme config in $EDITOR and reload theme
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && modifiers.contains(KeyModifiers::SHIFT)
+                        && code == KeyCode::Char('t')
+                    {
+                        let _ = open_theme_config_and_reload(&mut stdout, &theme);
+                        continue;
+                    }
+
                     let bytes = key_to_bytes(code, modifiers);
                     for b in bytes {
                         let _ = pty_writer.write_all(&[b]);
@@ -754,8 +951,8 @@ fn main() -> io::Result<()> {
         }
 
         // Redraw every frame: art at top, then terminal grid below
-        if let Ok(s) = screen.lock() {
-            let _ = render(&s, selection.as_ref(), art_height, &mut stdout);
+        if let (Ok(s), Ok(t)) = (screen.lock(), theme.lock()) {
+            let _ = render(&s, selection.as_ref(), art_height, &*t, &mut stdout);
         }
     }
 
