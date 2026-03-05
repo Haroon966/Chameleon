@@ -1,6 +1,8 @@
 # Chameleon
 
-A minimal terminal emulator written in Rust. It runs your shell in a PTY, parses escape sequences with the VTE library, and renders output using crossterm.
+A minimal terminal emulator written in Rust.
+
+![Chameleon screenshot](images/screenshot.png) It runs your shell in a PTY, parses escape sequences with the VTE library, and renders output using crossterm.
 
 ## Features
 
@@ -10,11 +12,13 @@ A minimal terminal emulator written in Rust. It runs your shell in a PTY, parses
 - **Resize** — Window resize updates the PTY size and redraws the screen
 - **Copy** — Select text with the mouse (click and drag), then **Ctrl+Shift+C** to copy to the system clipboard
 - **Theme** — Edit text color, background color, opacity, and font size via a config file; **Ctrl+Shift+T** opens the config in `$EDITOR` and reloads the theme on save
+- **AI commands** — **Ctrl+K** opens an AI bar: type a natural-language prompt and get a suggested shell command (via local Ollama). **Enter** injects and runs it; **Esc** dismisses.
 
 ## Requirements
 
 - Rust (edition 2021)
 - A Unix-like environment (Linux, macOS) for PTY support
+- For AI commands: [Ollama](https://ollama.ai) running locally with at least one model (e.g. `ollama pull llama3.2`)
 
 ## Build & Run
 
@@ -36,12 +40,13 @@ Exit by closing the shell (e.g. `exit` or Ctrl+D) or terminating the process.
 - **Select**: Click and drag with the left mouse button to select a rectangular region (shown highlighted).
 - **Copy**: Press **Ctrl+Shift+C** to copy the selection to the system clipboard.
 
-## Theme
+## Theme and text size
 
-Theme settings are stored in a config file. If the file does not exist, defaults are used.
+To configure the theme (text color, background color, opacity) and text size, edit the config file:
 
-- **Config path**: `$XDG_CONFIG_HOME/chameleon/config.toml` (on Linux/macOS typically `~/.config/chameleon/config.toml`).
-- **Edit and reload**: Press **Ctrl+Shift+T** to open the config file in your `$EDITOR` (or `$VISUAL`, or `nano`). When you exit the editor, the theme is reloaded and applied immediately.
+- **Config file**: `~/.config/chameleon/config.toml` (or `$XDG_CONFIG_HOME/chameleon/config.toml`). If the file does not exist, Chameleon uses built-in defaults until you create it.
+- **Quick edit**: Press **Ctrl+Shift+T** inside Chameleon to open the config file in your `$EDITOR` (or `$VISUAL`, or `nano`). Save and exit; the theme is reloaded and applied immediately.
+- **Manual edit**: Create or edit `~/.config/chameleon/config.toml` with the `[theme]` section shown below. Restart Chameleon or press **Ctrl+Shift+T** once to load the file.
 
 Example `config.toml`:
 
@@ -57,8 +62,21 @@ background_opacity = 0.95
 font_size = 14
 ```
 
-- **Text color** and **background color** are applied by the app (24-bit RGB).
-- **Font size** and **background opacity** are stored in the config. Many host terminals do not allow the application to change font size or window transparency; if yours does not, set font size and opacity in your terminal emulator’s own settings.
+- **Text color** (`default_foreground`) and **background color** (`default_background`) are applied by the app (hex colors, 24-bit RGB).
+- **Text size** is set with `font_size` (in points) in the config. Many host terminals do not let the app change font size; if yours does not, set the font size in your terminal emulator’s settings.
+- **Background opacity** (`background_opacity`, 0.0–1.0) is stored in the config. If your terminal ignores it, set transparency in your terminal emulator’s settings.
+
+## AI commands
+
+- **Ctrl+K** — Open the AI bar at the bottom. Type a prompt (e.g. “list files in /tmp by size”), press **Enter**. After the model responds, press **Enter** to inject and run the suggested command in the shell, or **Esc** to dismiss.
+
+AI uses **Ollama** by default. Ensure Ollama is running (`ollama serve` or start the Ollama app) and at least one model is pulled (e.g. `ollama pull llama3.2`). Optional config in `config.toml`:
+
+```toml
+[ai]
+model = "llama3.2:latest"   # optional; default is first available model
+base_url = "http://127.0.0.1:11434"   # optional; Ollama API URL
+```
 
 ## Architecture
 
@@ -75,7 +93,8 @@ font_size = 14
 | `portable-pty` | Cross-platform PTY                     |
 | `serde` / `toml` | Theme config parsing                 |
 | `vte`          | ANSI/VT escape parsing                 |
-| `arboard`      | System clipboard for copy              |
+| `arboard`      | System clipboard for copy               |
+| `ureq` / `serde_json` | Ollama API for AI command generation |
 
 ## License
 

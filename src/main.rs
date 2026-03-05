@@ -9,6 +9,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -72,6 +73,7 @@ impl Default for Theme {
 struct ThemeConfigFile {
     #[serde(rename = "theme")]
     theme: Option<ThemeSection>,
+    ai: Option<AiSection>,
 }
 
 #[derive(serde::Deserialize)]
@@ -80,6 +82,136 @@ struct ThemeSection {
     default_background: Option<String>,
     background_opacity: Option<f32>,
     font_size: Option<u8>,
+}
+
+#[derive(serde::Deserialize)]
+struct AiSection {
+    model: Option<String>,
+    #[allow(dead_code)] // reserved for future backends (e.g. llamacpp)
+    backend: Option<String>,
+    base_url: Option<String>,
+}
+
+/// Loaded AI config: base URL for Ollama and model name (None = use first available).
+#[derive(Clone, Debug)]
+struct AiConfig {
+    base_url: String,
+    model: Option<String>,
+}
+
+fn load_ai_config() -> AiConfig {
+    let default_url = "http://127.0.0.1:11434".to_string();
+    let config_path = match directories::ProjectDirs::from("", "", "chameleon") {
+        Some(dirs) => dirs.config_dir().join("config.toml"),
+        None => return AiConfig { base_url: default_url, model: None },
+    };
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return AiConfig { base_url: default_url, model: None },
+    };
+    let file_config: ThemeConfigFile = match toml::from_str(&contents) {
+        Ok(c) => c,
+        Err(_) => return AiConfig { base_url: default_url, model: None },
+    };
+    let section = match file_config.ai {
+        Some(s) => s,
+        None => return AiConfig { base_url: default_url, model: None },
+    };
+    let base_url = section
+        .base_url
+        .unwrap_or_else(|| default_url.clone());
+    AiConfig {
+        base_url,
+        model: section.model,
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Ollama: detect and list models
+// -----------------------------------------------------------------------------
+
+const OLLAMA_TIMEOUT_MS: u64 = 5000;
+
+/// Check if Ollama is reachable and return list of model names. Empty list if none.
+fn ollama_list_models(base_url: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let response = ureq::get(&url)
+        .timeout(std::time::Duration::from_millis(OLLAMA_TIMEOUT_MS))
+        .call()
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = response
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let models = body
+        .get("models")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+    let names: Vec<String> = models
+        .iter()
+        .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    Ok(names)
+}
+
+/// Resolve model to use: config model if set and available, else first from list, else error.
+fn ollama_resolve_model(base_url: &str, config_model: Option<&str>) -> Result<String, String> {
+    let list = ollama_list_models(base_url)?;
+    if list.is_empty() {
+        return Err("No models found. Pull a model with: ollama pull <name>".to_string());
+    }
+    if let Some(want) = config_model {
+        if list.iter().any(|n| n == want) {
+            return Ok(want.to_string());
+        }
+        return Err(format!("Configured model '{want}' not found. Available: {}", list.join(", ")));
+    }
+    Ok(list.into_iter().next().unwrap())
+}
+
+const OLLAMA_GENERATE_TIMEOUT_MS: u64 = 30_000;
+
+/// Build prompt for Ollama: system instruction + user message. Ollama uses a single "prompt" field.
+fn ollama_build_prompt(system: &str, user: &str) -> String {
+    format!("{}\n\n{}", system, user)
+}
+
+/// Call Ollama /api/generate, return the response text (one command). Strips markdown code blocks.
+fn ollama_generate(base_url: &str, model: &str, prompt: &str) -> Result<String, String> {
+    let url = format!("{}/api/generate", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false
+    });
+    let response = ureq::post(&url)
+        .timeout(std::time::Duration::from_millis(OLLAMA_GENERATE_TIMEOUT_MS))
+        .send_json(body)
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = response.into_json().map_err(|e| e.to_string())?;
+    let text = body
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    // Strip markdown code blocks if present
+    let text = text
+        .strip_prefix("```")
+        .and_then(|s| s.strip_suffix("```"))
+        .map(|s| s.trim())
+        .unwrap_or(text.as_str())
+        .to_string();
+    let text = text
+        .strip_prefix("bash")
+        .or_else(|| text.strip_prefix("sh"))
+        .map(|s| s.trim())
+        .unwrap_or(text.as_str())
+        .to_string();
+    if text.is_empty() {
+        return Err("Model returned empty response".to_string());
+    }
+    Ok(text)
 }
 
 fn load_theme() -> Theme {
@@ -365,6 +497,21 @@ impl Screen {
         }
     }
 
+    /// Last N rows of the grid as plain text (trimmed, newline-joined). Reserved for future use.
+    #[allow(dead_code)]
+    fn get_recent_text(&self, last_n_rows: usize) -> String {
+        let start = self.rows.saturating_sub(last_n_rows);
+        let mut lines = Vec::new();
+        for r in start..self.rows {
+            if r < self.grid.len() {
+                let row = &self.grid[r];
+                let line: String = row.iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    }
+
 }
 
 // -----------------------------------------------------------------------------
@@ -632,6 +779,143 @@ impl Selection {
 }
 
 // -----------------------------------------------------------------------------
+// AI mode and bar (command generation, suggest fix)
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum AiMode {
+    Idle,
+    PromptInput { buffer: String },
+    Thinking,
+    SuggestionReady { command: String },
+    Error { message: String },
+}
+
+const AI_BOX_WIDTH: usize = 58;
+const AI_BOX_HEIGHT: usize = 6;
+
+/// Renders the AI command modal: a centered box with "Command instructions", input area, [X], and "Quick Question".
+fn render_ai_bar(
+    ai_mode: &AiMode,
+    term_rows: usize,
+    term_cols: usize,
+    theme: &Theme,
+    stdout: &mut io::Stdout,
+) -> io::Result<()> {
+    if matches!(ai_mode, AiMode::Idle) {
+        return Ok(());
+    }
+    let w = AI_BOX_WIDTH.min(term_cols.saturating_sub(2));
+    let h = AI_BOX_HEIGHT.min(term_rows.saturating_sub(2));
+    let start_col = term_cols.saturating_sub(w) / 2;
+    let start_row = term_rows.saturating_sub(h) / 2;
+    let w_u = w as u16;
+    let h_u = h as u16;
+
+    let fg = crossterm::style::Color::Rgb {
+        r: theme.default_foreground.0,
+        g: theme.default_foreground.1,
+        b: theme.default_foreground.2,
+    };
+    let bg = crossterm::style::Color::Rgb {
+        r: theme.default_background.0,
+        g: theme.default_background.1,
+        b: theme.default_background.2,
+    };
+    let dim = crossterm::style::Color::Rgb { r: 0x66, g: 0x66, b: 0x66 };
+
+    // Top border: ┌── Command instructions ────────── [X] ──┐
+    let top_left = start_col as u16;
+    let top_row = start_row as u16;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, top_row),
+        crossterm::style::SetForegroundColor(fg),
+        crossterm::style::SetBackgroundColor(bg),
+        crossterm::style::Print('┌'),
+        crossterm::style::Print("─".repeat(w.saturating_sub(2))),
+        crossterm::style::Print('┐')
+    )?;
+    // Title and close on top line (overwrite part of the border line)
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + 2, top_row),
+        crossterm::style::Print(" Command instructions ")
+    )?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + w_u - 5, top_row),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print(" [X]"),
+        crossterm::style::SetForegroundColor(fg)
+    )?;
+
+    // Content lines
+    let (content_line1, content_line2) = match ai_mode {
+        AiMode::PromptInput { buffer } => {
+            let max_len = w.saturating_sub(6);
+            let display = if buffer.len() > max_len {
+                format!("{}…", &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..])
+            } else {
+                buffer.clone()
+            };
+            (format!("  {}_", display), String::new())
+        }
+        AiMode::Thinking => ("  Thinking…".to_string(), String::new()),
+        AiMode::SuggestionReady { command } => {
+            let max_len = w.saturating_sub(6);
+            let display = if command.len() > max_len {
+                format!("{}…", &command[..max_len.saturating_sub(1)])
+            } else {
+                command.clone()
+            };
+            (format!("  {}", display), "  Enter=run  Esc=dismiss".to_string())
+        }
+        AiMode::Error { message } => {
+            let max_len = w.saturating_sub(8);
+            let display = if message.len() > max_len {
+                format!("{}…", &message[..max_len.saturating_sub(1)])
+            } else {
+                message.clone()
+            };
+            (format!("  Error: {}", display), "  Esc to close".to_string())
+        }
+        AiMode::Idle => unreachable!(),
+    };
+
+    for (i, line) in [content_line1, content_line2].iter().enumerate() {
+        let r = top_row + 1 + i as u16;
+        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::Print('│'))?;
+        let padded = format!("{:<width$}", line, width = w.saturating_sub(2));
+        queue!(stdout, crossterm::style::Print(&padded))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+    }
+
+    // Empty middle row(s)
+    for i in 3..h.saturating_sub(1) {
+        let r = top_row + i as u16;
+        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(" ".repeat(w.saturating_sub(2))))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+    }
+
+    // Bottom row: Quick Question and arrow
+    let bottom_row = top_row + h_u - 1;
+    queue!(stdout, cursor::MoveTo(top_left, bottom_row), crossterm::style::Print('└'))?;
+    queue!(stdout, crossterm::style::Print("─".repeat(w.saturating_sub(2))), crossterm::style::Print('┘'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + w_u.saturating_sub(20), bottom_row),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print(" Quick Question  ▲ "),
+        crossterm::style::SetForegroundColor(fg)
+    )?;
+
+    stdout.flush()?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Render screen buffer to crossterm
 // -----------------------------------------------------------------------------
 
@@ -640,6 +924,7 @@ fn render(
     selection: Option<&Selection>,
     art_height: usize,
     theme: &Theme,
+    ai_bar_visible: bool,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     let (_term_rows, term_cols) = terminal::size()
@@ -656,7 +941,12 @@ fn render(
         }
     }
 
-    // Draw terminal grid below the art
+    // Draw terminal grid below the art. When AI bar is visible, skip last row so bar fits.
+    let grid_rows = if ai_bar_visible {
+        screen.rows.saturating_sub(1)
+    } else {
+        screen.rows
+    };
     let top_offset = art_height;
     queue!(stdout, cursor::MoveTo(0, top_offset as u16))?;
     let mut last_fg = 255;
@@ -664,7 +954,7 @@ fn render(
     let mut last_bold = false;
     let sel = selection.and_then(|s| (!s.is_empty()).then(|| s.normalized()));
 
-    for (r, row) in screen.grid.iter().enumerate() {
+    for (r, row) in screen.grid.iter().take(grid_rows).enumerate() {
         for (c, cell) in row.iter().enumerate() {
             let in_selection = sel.map(|(r1, c1, r2, c2)| r >= r1 && r <= r2 && c >= c1 && c <= c2).unwrap_or(false);
             let draw_r = top_offset + r;
@@ -857,6 +1147,12 @@ fn main() -> io::Result<()> {
     let mut selection: Option<Selection> = None;
     let mut selecting = false;
 
+    // AI command generation and suggest-fix
+    let ai_config = load_ai_config();
+    let (ai_tx, ai_rx) = mpsc::channel();
+    let mut ai_mode = AiMode::Idle;
+    const CMD_SYSTEM: &str = "You are a shell assistant. Reply with exactly one shell command, no explanation, no markdown code blocks.";
+
     while running.load(Ordering::Relaxed) {
         // Exit when shell exits (Ctrl+D or `exit`)
         if child.try_wait().ok().flatten().is_some() {
@@ -872,7 +1168,7 @@ fn main() -> io::Result<()> {
                     // Ctrl+Shift+C: copy selection to clipboard (do not send to PTY)
                     if modifiers.contains(KeyModifiers::CONTROL)
                         && modifiers.contains(KeyModifiers::SHIFT)
-                        && code == KeyCode::Char('c')
+                        && matches!(code, KeyCode::Char(c) if c == 'c' || c == 'C')
                     {
                         if let Some(ref sel) = selection {
                             if let Ok(s) = screen.lock() {
@@ -890,9 +1186,96 @@ fn main() -> io::Result<()> {
                     // Ctrl+Shift+T: open theme config in $EDITOR and reload theme
                     if modifiers.contains(KeyModifiers::CONTROL)
                         && modifiers.contains(KeyModifiers::SHIFT)
-                        && code == KeyCode::Char('t')
+                        && matches!(code, KeyCode::Char(c) if c == 't' || c == 'T')
                     {
                         let _ = open_theme_config_and_reload(&mut stdout, &theme);
+                        continue;
+                    }
+
+                    // Ctrl+K: open AI prompt to generate commands (only when Idle)
+                    if modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(code, KeyCode::Char(c) if c == 'k' || c == 'K')
+                    {
+                        if matches!(ai_mode, AiMode::Idle) {
+                            ai_mode = AiMode::PromptInput {
+                                buffer: String::new(),
+                            };
+                        }
+                        continue;
+                    }
+
+                    // When in AI mode, handle keys locally (do not send to PTY)
+                    if !matches!(ai_mode, AiMode::Idle) {
+                        // Poll for worker result when Thinking
+                        if matches!(ai_mode, AiMode::Thinking) {
+                            if let Ok(res) = ai_rx.try_recv() {
+                                ai_mode = match res {
+                                    Ok(cmd) => AiMode::SuggestionReady { command: cmd },
+                                    Err(e) => AiMode::Error { message: e },
+                                };
+                            }
+                        }
+                        match &mut ai_mode {
+                            AiMode::PromptInput { buffer } => {
+                                match code {
+                                    KeyCode::Char(c) if !c.is_control() => {
+                                        buffer.push(c);
+                                    }
+                                    KeyCode::Backspace => {
+                                        buffer.pop();
+                                    }
+                                    KeyCode::Enter => {
+                                        let prompt = buffer.trim().to_string();
+                                        if prompt.is_empty() {
+                                            ai_mode = AiMode::Idle;
+                                        } else {
+                                            let base_url = ai_config.base_url.clone();
+                                            let config_model = ai_config.model.clone();
+                                            let tx = ai_tx.clone();
+                                            thread::spawn(move || {
+                                                let model = match ollama_resolve_model(&base_url, config_model.as_deref()) {
+                                                    Ok(m) => m,
+                                                    Err(e) => {
+                                                        let _ = tx.send(Err(e));
+                                                        return;
+                                                    }
+                                                };
+                                                let full_prompt = ollama_build_prompt(CMD_SYSTEM, &prompt);
+                                                let res = ollama_generate(&base_url, &model, &full_prompt);
+                                                let _ = tx.send(res);
+                                            });
+                                            ai_mode = AiMode::Thinking;
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            AiMode::SuggestionReady { command } => {
+                                if code == KeyCode::Enter {
+                                    // Inject command into PTY and run
+                                    for c in command.chars() {
+                                        let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
+                                        for b in bytes {
+                                            let _ = pty_writer.write_all(&[b]);
+                                        }
+                                    }
+                                    let _ = pty_writer.write_all(&[b'\r']);
+                                    let _ = pty_writer.flush();
+                                    ai_mode = AiMode::Idle;
+                                } else if code == KeyCode::Esc {
+                                    ai_mode = AiMode::Idle;
+                                }
+                            }
+                            AiMode::Error { .. } => {
+                                if code == KeyCode::Enter || code == KeyCode::Esc {
+                                    ai_mode = AiMode::Idle;
+                                }
+                            }
+                            AiMode::Thinking | AiMode::Idle => {}
+                        }
                         continue;
                     }
 
@@ -950,9 +1333,27 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Redraw every frame: art at top, then terminal grid below
+        // When Thinking, poll for worker result even without a key event
+        if matches!(ai_mode, AiMode::Thinking) {
+            if let Ok(res) = ai_rx.try_recv() {
+                ai_mode = match res {
+                    Ok(cmd) => AiMode::SuggestionReady { command: cmd },
+                    Err(e) => AiMode::Error { message: e },
+                };
+            }
+        }
+
+        // Redraw every frame: art at top, then terminal grid; AI modal overlays center when not Idle
         if let (Ok(s), Ok(t)) = (screen.lock(), theme.lock()) {
-            let _ = render(&s, selection.as_ref(), art_height, &*t, &mut stdout);
+            let _ = render(&s, selection.as_ref(), art_height, &*t, false, &mut stdout);
+        }
+        if !matches!(ai_mode, AiMode::Idle) {
+            let (term_rows, term_cols) = terminal::size()
+                .map(|(c, r)| (r as usize, c as usize))
+                .unwrap_or((24, 80));
+            if let Ok(t) = theme.lock() {
+                let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, &mut stdout);
+            }
         }
     }
 
