@@ -99,6 +99,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
+name = "chameleon"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "crossterm",
+ "directories",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "toml",
+ "ureq",
+ "vte",
+]
+
+[[package]]
 name = "clipboard-win"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,21 +520,6 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
-
-[[package]]
-name = "minimal-term"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "crossterm",
- "directories",
- "portable-pty",
- "serde",
- "serde_json",
- "toml",
- "ureq",
- "vte",
-]
 
 [[package]]
 name = "miniz_oxide"

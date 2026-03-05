@@ -1,8 +1,8 @@
 [package]
-name = "minimal-term"
+name = "chameleon"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal working terminal emulator in Rust"
+description = "Chameleon — minimal terminal emulator in Rust"
 
 [dependencies]
 arboard = "3.2"

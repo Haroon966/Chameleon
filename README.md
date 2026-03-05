@@ -6,6 +6,18 @@ A minimal terminal emulator written in Rust.
 
 It runs your shell in a PTY, parses escape sequences with the VTE library, and renders output using crossterm.
 
+## Install
+
+Download the binary for your platform from [Releases](releases). No other software (Rust, package managers, etc.) is required.
+
+Example (Linux/macOS): extract the tarball and put the `chameleon` binary in a directory in your `PATH`:
+
+```bash
+tar -xzf chameleon-*.tar.gz && mv chameleon-*/chameleon ~/bin/
+```
+
+(Replace `~/bin/` with `/usr/local/bin` or another directory in your `PATH` if you prefer.)
+
 ## Features
 
 - **PTY + shell** — Spawns your `$SHELL` (or `/bin/sh`) in a pseudo-terminal
@@ -32,7 +44,7 @@ cargo run
 Or run the release binary directly:
 
 ```bash
-./target/release/minimal-term
+./target/release/chameleon
 ```
 
 Exit by closing the shell (e.g. `exit` or Ctrl+D) or terminating the process.
