@@ -100,4 +100,4 @@ base_url = "http://127.0.0.1:11434"   # optional; Ollama API URL
 
 ## License
 
-See repository or project root for license information.
+See [LICENSE](LICENSE) in the project root. Use is free for personal and non-commercial use; modification, rebranding, and resale require written permission from the copyright holder.
