@@ -2,7 +2,9 @@
 
 A minimal terminal emulator written in Rust.
 
-![Chameleon screenshot](images/screenshot.png) It runs your shell in a PTY, parses escape sequences with the VTE library, and renders output using crossterm.
+![Chameleon screenshot](images/Chameleon.png)
+
+It runs your shell in a PTY, parses escape sequences with the VTE library, and renders output using crossterm.
 
 ## Features
 
