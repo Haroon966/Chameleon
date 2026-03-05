@@ -26,13 +26,13 @@ tar -xzf chameleon-*.tar.gz && mv chameleon-*/chameleon ~/bin/
 - **Resize** — Window resize updates the PTY size and redraws the screen
 - **Copy** — Select text with the mouse (click and drag), then **Ctrl+Shift+C** to copy to the system clipboard
 - **Theme** — Edit text color, background color, opacity, and font size via a config file; **Ctrl+Shift+T** opens the config in `$EDITOR` and reloads the theme on save
-- **AI commands** — **Ctrl+K** opens an AI bar: type a natural-language prompt and get a suggested shell command (via local Ollama). **Enter** injects and runs it; **Esc** dismisses.
+- **AI commands** — **Ctrl+K** opens an AI bar: type a natural-language prompt and get a suggested shell command. Supports **Ollama** (local), **OpenAI**, **Gemini**, and **Groq**. **Enter** injects and runs the suggestion; **Esc** dismisses.
 
 ## Requirements
 
 - Rust (edition 2021)
 - A Unix-like environment (Linux, macOS) for PTY support
-- For AI commands: [Ollama](https://ollama.ai) running locally with at least one model (e.g. `ollama pull llama3.2`)
+- For AI commands: either [Ollama](https://ollama.ai) with at least one model, or an API key for OpenAI, Gemini, or Groq
 
 ## Build & Run
 
@@ -51,8 +51,8 @@ Exit by closing the shell (e.g. `exit` or Ctrl+D) or terminating the process.
 
 ## Copy
 
-- **Select**: Click and drag with the left mouse button to select a rectangular region (shown highlighted).
-- **Copy**: Press **Ctrl+Shift+C** to copy the selection to the system clipboard.
+- **Select**: Click and drag with the left mouse button to select text in reading order (stream selection, like a traditional terminal). Double-click selects a word; triple-click selects the whole line.
+- **Copy**: The selection is copied to the system clipboard when you release the mouse button. You can also press **Ctrl+Shift+C** to copy.
 
 ## Theme and text size
 
@@ -82,14 +82,36 @@ font_size = 14
 
 ## AI commands
 
-- **Ctrl+K** — Open the AI bar at the bottom. Type a prompt (e.g. “list files in /tmp by size”), press **Enter**. After the model responds, press **Enter** to inject and run the suggested command in the shell, or **Esc** to dismiss.
+- **Ctrl+K** — Open the AI bar. Type a prompt (e.g. “list files in /tmp by size”), press **Enter**. After the model responds, press **Enter** to inject and run the suggested command, or **Esc** to dismiss.
+- **/model** or **/models** (then Enter) — Open the **backend picker**: choose **Ollama** (if you have local models), **OpenAI**, **Gemini**, or **Groq** (each shown only if that provider has an API key configured). Then pick a model for that backend. **Configure API** adds or changes an API key (wizard: choose provider, enter key, save to config). **Remove API** (shown when at least one API is configured) lets you remove a provider’s key from the config file.
+- The status line shows the current backend and model (e.g. `Ollama · llama3.2` or `OpenAI · gpt-4o-mini`).
 
-AI uses **Ollama** by default. Ensure Ollama is running (`ollama serve` or start the Ollama app) and at least one model is pulled (e.g. `ollama pull llama3.2`). Optional config in `config.toml`:
+**Backends**
+
+- **Ollama** — Local models; no API key. Run `ollama serve` and pull a model (e.g. `ollama pull llama3.2`). Shown in the picker only when at least one model is available.
+- **OpenAI** — Set `OPENAI_API_KEY` in the environment, or add a key via **Configure API** (stored under `[ai.providers.openai]` in config).
+- **Gemini** — Set `GEMINI_API_KEY` or configure via **Configure API** (`[ai.providers.gemini]`).
+- **Groq** — Set `GROQ_API_KEY` or configure via **Configure API** (`[ai.providers.groq]`).
+
+Prefer environment variables for API keys; the wizard can also write keys into `config.toml` for convenience.
+
+**Config** (`~/.config/chameleon/config.toml`):
 
 ```toml
 [ai]
-model = "llama3.2:latest"   # optional; default is first available model
-base_url = "http://127.0.0.1:11434"   # optional; Ollama API URL
+default_backend = "ollama"   # optional; one of ollama, openai, gemini, groq
+base_url = "http://127.0.0.1:11434"   # for Ollama
+model = "llama3.2:latest"   # default model for Ollama
+
+# API keys (optional; env vars preferred)
+[ai.providers.openai]
+api_key = "sk-..."
+
+[ai.providers.gemini]
+api_key = "..."
+
+[ai.providers.groq]
+api_key = "..."
 ```
 
 ## Architecture
@@ -108,7 +130,7 @@ base_url = "http://127.0.0.1:11434"   # optional; Ollama API URL
 | `serde` / `toml` | Theme config parsing                 |
 | `vte`          | ANSI/VT escape parsing                 |
 | `arboard`      | System clipboard for copy               |
-| `ureq` / `serde_json` | Ollama API for AI command generation |
+| `ureq` / `serde_json` | Ollama, OpenAI, Gemini, Groq APIs for AI command generation |
 
 ## License
 

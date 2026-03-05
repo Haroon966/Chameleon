@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -84,46 +84,217 @@ struct ThemeSection {
     font_size: Option<u8>,
 }
 
+#[derive(serde::Deserialize, Default, Clone, Debug)]
+struct ProviderConfig {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    #[allow(dead_code)]
+    model: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default, Clone, Debug)]
+struct AiProvidersSection {
+    openai: Option<ProviderConfig>,
+    gemini: Option<ProviderConfig>,
+    groq: Option<ProviderConfig>,
+}
+
 #[derive(serde::Deserialize)]
 struct AiSection {
     model: Option<String>,
-    #[allow(dead_code)] // reserved for future backends (e.g. llamacpp)
     backend: Option<String>,
     base_url: Option<String>,
+    #[serde(default)]
+    providers: Option<AiProvidersSection>,
 }
 
-/// Loaded AI config: base URL for Ollama and model name (None = use first available).
+/// AI backend (Ollama = local; others = API with key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AiBackend {
+    Ollama,
+    OpenAi,
+    Gemini,
+    Groq,
+}
+
+impl std::fmt::Display for AiBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AiBackend::Ollama => write!(f, "Ollama"),
+            AiBackend::OpenAi => write!(f, "OpenAI"),
+            AiBackend::Gemini => write!(f, "Gemini"),
+            AiBackend::Groq => write!(f, "Groq"),
+        }
+    }
+}
+
+impl AiBackend {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "ollama" => Some(AiBackend::Ollama),
+            "openai" => Some(AiBackend::OpenAi),
+            "gemini" => Some(AiBackend::Gemini),
+            "groq" => Some(AiBackend::Groq),
+            _ => None,
+        }
+    }
+}
+
+/// Loaded AI config: Ollama base URL, default backend/model, per-provider keys.
 #[derive(Clone, Debug)]
 struct AiConfig {
-    base_url: String,
-    model: Option<String>,
+    ollama_base_url: String,
+    default_backend: AiBackend,
+    default_model: Option<String>,
+    providers: AiProvidersSection,
 }
 
 fn load_ai_config() -> AiConfig {
     let default_url = "http://127.0.0.1:11434".to_string();
     let config_path = match directories::ProjectDirs::from("", "", "chameleon") {
         Some(dirs) => dirs.config_dir().join("config.toml"),
-        None => return AiConfig { base_url: default_url, model: None },
+        None => {
+            return AiConfig {
+                ollama_base_url: default_url.clone(),
+                default_backend: AiBackend::Ollama,
+                default_model: None,
+                providers: AiProvidersSection::default(),
+            }
+        }
     };
     let contents = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return AiConfig { base_url: default_url, model: None },
+        Err(_) => {
+            return AiConfig {
+                ollama_base_url: default_url.clone(),
+                default_backend: AiBackend::Ollama,
+                default_model: None,
+                providers: AiProvidersSection::default(),
+            }
+        }
     };
     let file_config: ThemeConfigFile = match toml::from_str(&contents) {
         Ok(c) => c,
-        Err(_) => return AiConfig { base_url: default_url, model: None },
+        Err(_) => {
+            return AiConfig {
+                ollama_base_url: default_url.clone(),
+                default_backend: AiBackend::Ollama,
+                default_model: None,
+                providers: AiProvidersSection::default(),
+            }
+        }
     };
     let section = match file_config.ai {
         Some(s) => s,
-        None => return AiConfig { base_url: default_url, model: None },
+        None => {
+            return AiConfig {
+                ollama_base_url: default_url.clone(),
+                default_backend: AiBackend::Ollama,
+                default_model: None,
+                providers: AiProvidersSection::default(),
+            }
+        }
     };
-    let base_url = section
+    let ollama_base_url = section
         .base_url
         .unwrap_or_else(|| default_url.clone());
+    let default_backend = section
+        .backend
+        .as_deref()
+        .and_then(AiBackend::from_str)
+        .unwrap_or(AiBackend::Ollama);
+    let providers = section.providers.unwrap_or_default();
     AiConfig {
-        base_url,
-        model: section.model,
+        ollama_base_url,
+        default_backend,
+        default_model: section.model,
+        providers,
     }
+}
+
+impl AiConfig {
+    fn openai_api_key(&self) -> Option<String> {
+        std::env::var("OPENAI_API_KEY").ok().or_else(|| {
+            self.providers
+                .openai
+                .as_ref()
+                .and_then(|p| p.api_key.clone())
+        })
+    }
+    fn gemini_api_key(&self) -> Option<String> {
+        std::env::var("GEMINI_API_KEY").ok().or_else(|| {
+            self.providers
+                .gemini
+                .as_ref()
+                .and_then(|p| p.api_key.clone())
+        })
+    }
+    fn groq_api_key(&self) -> Option<String> {
+        std::env::var("GROQ_API_KEY").ok().or_else(|| {
+            self.providers
+                .groq
+                .as_ref()
+                .and_then(|p| p.api_key.clone())
+        })
+    }
+    fn is_configured(&self, backend: AiBackend) -> bool {
+        match backend {
+            AiBackend::Ollama => true,
+            AiBackend::OpenAi => self.openai_api_key().is_some(),
+            AiBackend::Gemini => self.gemini_api_key().is_some(),
+            AiBackend::Groq => self.groq_api_key().is_some(),
+        }
+    }
+    fn openai_base_url(&self) -> String {
+        self.providers
+            .openai
+            .as_ref()
+            .and_then(|p| p.base_url.clone())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
+    }
+    fn groq_base_url(&self) -> String {
+        self.providers
+            .groq
+            .as_ref()
+            .and_then(|p| p.base_url.clone())
+            .unwrap_or_else(|| "https://api.groq.com/openai/v1".to_string())
+    }
+}
+
+/// Entry in the backend picker: either a backend, "Configure API", or "Remove API".
+#[derive(Clone, Debug)]
+enum BackendChoice {
+    Backend(AiBackend),
+    ConfigureApi,
+    RemoveApi,
+}
+
+/// Build list of backends to show: Ollama if local models exist, each API if configured, Configure API, Remove API (if any API configured).
+fn available_backends(ai_config: &AiConfig) -> Vec<BackendChoice> {
+    let mut choices = Vec::new();
+    if ollama_list_models(&ai_config.ollama_base_url)
+        .map(|l| !l.is_empty())
+        .unwrap_or(false)
+    {
+        choices.push(BackendChoice::Backend(AiBackend::Ollama));
+    }
+    if ai_config.is_configured(AiBackend::OpenAi) {
+        choices.push(BackendChoice::Backend(AiBackend::OpenAi));
+    }
+    if ai_config.is_configured(AiBackend::Gemini) {
+        choices.push(BackendChoice::Backend(AiBackend::Gemini));
+    }
+    if ai_config.is_configured(AiBackend::Groq) {
+        choices.push(BackendChoice::Backend(AiBackend::Groq));
+    }
+    choices.push(BackendChoice::ConfigureApi);
+    if ai_config.is_configured(AiBackend::OpenAi)
+        || ai_config.is_configured(AiBackend::Gemini)
+        || ai_config.is_configured(AiBackend::Groq)
+    {
+        choices.push(BackendChoice::RemoveApi);
+    }
+    choices
 }
 
 // -----------------------------------------------------------------------------
@@ -214,6 +385,174 @@ fn ollama_generate(base_url: &str, model: &str, prompt: &str) -> Result<String, 
     Ok(text)
 }
 
+// -----------------------------------------------------------------------------
+// OpenAI: chat completions (and OpenAI-compatible, e.g. Groq)
+// -----------------------------------------------------------------------------
+
+const OPENAI_TIMEOUT_MS: u64 = 30_000;
+
+fn strip_code_blocks(text: &str) -> String {
+    let text = text.trim().to_string();
+    let text = text
+        .strip_prefix("```")
+        .and_then(|s| s.strip_suffix("```"))
+        .map(|s| s.trim())
+        .unwrap_or(text.as_str())
+        .to_string();
+    let text = text
+        .strip_prefix("bash")
+        .or_else(|| text.strip_prefix("sh"))
+        .map(|s| s.trim())
+        .unwrap_or(text.as_str())
+        .to_string();
+    text
+}
+
+/// OpenAI (and compatible) chat completions; returns single message content.
+fn openai_generate(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "max_tokens": 500
+    });
+    let response = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .timeout(std::time::Duration::from_millis(OPENAI_TIMEOUT_MS))
+        .send_json(body)
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = response.into_json().map_err(|e| e.to_string())?;
+    let text = body
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let text = strip_code_blocks(&text);
+    if text.is_empty() {
+        return Err("Model returned empty response".to_string());
+    }
+    Ok(text)
+}
+
+/// List OpenAI models (ids). Falls back to a static list on error.
+fn openai_list_models(base_url: &str, api_key: &str) -> Vec<String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .timeout(std::time::Duration::from_millis(OLLAMA_TIMEOUT_MS))
+        .call();
+    match response {
+        Ok(resp) => {
+            let body: serde_json::Value = match resp.into_json() {
+                Ok(b) => b,
+                Err(_) => return openai_default_models(),
+            };
+            let data = match body.get("data").and_then(|d| d.as_array()) {
+                Some(d) => d,
+                None => return openai_default_models(),
+            };
+            let names: Vec<String> = data
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
+                .filter(|id| id.starts_with("gpt-") || id.contains("gpt"))
+                .collect();
+            if names.is_empty() {
+                openai_default_models()
+            } else {
+                names
+            }
+        }
+        Err(_) => openai_default_models(),
+    }
+}
+
+fn openai_default_models() -> Vec<String> {
+    vec![
+        "gpt-4o".to_string(),
+        "gpt-4o-mini".to_string(),
+        "gpt-4-turbo".to_string(),
+        "gpt-3.5-turbo".to_string(),
+    ]
+}
+
+// -----------------------------------------------------------------------------
+// Gemini: generate and model list (static; API differs from OpenAI)
+// -----------------------------------------------------------------------------
+
+fn gemini_list_models() -> Vec<String> {
+    vec![
+        "gemini-2.0-flash".to_string(),
+        "gemini-1.5-pro".to_string(),
+        "gemini-1.5-flash".to_string(),
+        "gemini-1.0-pro".to_string(),
+    ]
+}
+
+/// Gemini generate via REST (generativelanguage.googleapis.com). Uses generateContent.
+fn gemini_generate(api_key: &str, model: &str, system: &str, user: &str) -> Result<String, String> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+    let contents = vec![
+        serde_json::json!({ "role": "user", "parts": [{ "text": system }] }),
+        serde_json::json!({ "role": "user", "parts": [{ "text": user }] }),
+    ];
+    let body = serde_json::json!({
+        "contents": contents,
+        "generationConfig": { "maxOutputTokens": 500 }
+    });
+    let response = ureq::post(&url)
+        .timeout(std::time::Duration::from_millis(OPENAI_TIMEOUT_MS))
+        .send_json(body)
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = response.into_json().map_err(|e| e.to_string())?;
+    let text = body
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let text = strip_code_blocks(&text);
+    if text.is_empty() {
+        return Err("Model returned empty response".to_string());
+    }
+    Ok(text)
+}
+
+// -----------------------------------------------------------------------------
+// Groq: OpenAI-compatible API
+// -----------------------------------------------------------------------------
+
+fn groq_list_models() -> Vec<String> {
+    vec![
+        "llama-3.3-70b-versatile".to_string(),
+        "llama-3.1-8b-instant".to_string(),
+        "mixtral-8x7b-32768".to_string(),
+    ]
+}
+
 fn load_theme() -> Theme {
     let mut theme = Theme::default();
     let config_path = match directories::ProjectDirs::from("", "", "chameleon") {
@@ -254,6 +593,70 @@ fn load_theme() -> Theme {
 fn theme_config_path() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("", "", "chameleon")
         .map(|d| d.config_dir().join("config.toml"))
+}
+
+/// Write a provider's API key into config.toml (merge with existing). Key is stored under [ai.providers.<provider>].
+fn write_provider_api_key(provider: &str, api_key: &str) -> Result<(), String> {
+    let config_path = match theme_config_path() {
+        Some(p) => p,
+        None => return Err("No config directory".to_string()),
+    };
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_else(|_| String::new());
+    let contents = if contents.trim().is_empty() {
+        DEFAULT_CONFIG.to_string()
+    } else {
+        contents
+    };
+    let mut root: toml::Value = toml::from_str(&contents).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let root_table = root.as_table_mut().ok_or("config root is not a table")?;
+    let ai_table = root_table
+        .entry("ai".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let ai = ai_table.as_table_mut().ok_or("ai is not a table")?;
+    let providers_table = ai
+        .entry("providers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let providers = providers_table.as_table_mut().ok_or("ai.providers is not a table")?;
+    let provider_table = providers
+        .entry(provider.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let prov = provider_table.as_table_mut().ok_or("provider entry is not a table")?;
+    prov.insert("api_key".to_string(), toml::Value::String(api_key.to_string()));
+    let new_contents = toml::ser::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&config_path, new_contents).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Remove a provider's API key from config.toml (deletes [ai.providers.<provider>]).
+/// If the key was set only via env var, the backend will still appear until the env var is unset.
+fn remove_provider_api_key(provider: &str) -> Result<(), String> {
+    let config_path = match theme_config_path() {
+        Some(p) => p,
+        None => return Err("No config directory".to_string()),
+    };
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_else(|_| String::new());
+    let contents = if contents.trim().is_empty() {
+        return Ok(());
+    } else {
+        contents
+    };
+    let mut root: toml::Value = toml::from_str(&contents).map_err(|e| e.to_string())?;
+    let root_table = root.as_table_mut().ok_or("config root is not a table")?;
+    let Some(ai_table) = root_table.get_mut("ai") else {
+        return Ok(());
+    };
+    let ai = ai_table.as_table_mut().ok_or("ai is not a table")?;
+    let Some(providers_table) = ai.get_mut("providers") else {
+        return Ok(());
+    };
+    let providers = providers_table.as_table_mut().ok_or("ai.providers is not a table")?;
+    providers.remove(provider);
+    let new_contents = toml::ser::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&config_path, new_contents).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Default config content written when the file does not exist.
@@ -738,7 +1141,8 @@ impl Screen {
 // Selection (for copy)
 // -----------------------------------------------------------------------------
 
-/// Rectangular selection: (top_row, left_col) to (bottom_row, right_col) inclusive.
+/// Stream selection (traditional terminal): start and end position in reading order (row-major).
+/// Selecting from (1,5) to (2,3) selects end of line 1 + start of line 2, not a rectangle.
 #[derive(Clone, Copy, Debug, Default)]
 struct Selection {
     start_row: usize,
@@ -752,14 +1156,33 @@ impl Selection {
         self.start_row == self.end_row && self.start_col == self.end_col
     }
 
-    /// Normalize so we have top-left and bottom-right.
+    /// True if (r1, c1) is before or equal to (r2, c2) in stream (reading) order.
+    fn stream_order_before(r1: usize, c1: usize, r2: usize, c2: usize) -> bool {
+        r1 < r2 || (r1 == r2 && c1 <= c2)
+    }
+
+    /// Normalize to (first_row, first_col, last_row, last_col) in stream order.
     fn normalized(&self) -> (usize, usize, usize, usize) {
-        let (r1, c1) = (self.start_row.min(self.end_row), self.start_col.min(self.end_col));
-        let (r2, c2) = (self.start_row.max(self.end_row), self.start_col.max(self.end_col));
+        let (r1, c1, r2, c2) = if Self::stream_order_before(
+            self.start_row, self.start_col,
+            self.end_row, self.end_col,
+        ) {
+            (self.start_row, self.start_col, self.end_row, self.end_col)
+        } else {
+            (self.end_row, self.end_col, self.start_row, self.start_col)
+        };
         (r1, c1, r2, c2)
     }
 
-    /// Extract selected text from screen (rectangle, line-by-line).
+    /// True if cell (r, c) is inside the stream selection [first..=last].
+    fn contains_cell(&self, r: usize, c: usize) -> bool {
+        let (r1, c1, r2, c2) = self.normalized();
+        let after_start = r > r1 || (r == r1 && c >= c1);
+        let before_end = r < r2 || (r == r2 && c <= c2);
+        after_start && before_end
+    }
+
+    /// Extract selected text in reading order (like traditional terminal copy).
     fn extract_from(&self, screen: &Screen) -> String {
         let (r1, c1, r2, c2) = self.normalized();
         let mut lines = Vec::new();
@@ -778,9 +1201,58 @@ impl Selection {
     }
 }
 
+/// True if the character is part of a "word" for double-click selection (alphanumeric + underscore).
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphabetic() || ch.is_ascii_digit() || ch == '_'
+}
+
+/// Word at (row, col) in stream order: (start_row, start_col, end_row, end_col).
+fn selection_word_at(screen: &Screen, row: usize, col: usize) -> (usize, usize, usize, usize) {
+    if row >= screen.grid.len() {
+        return (row, col, row, col);
+    }
+    let line = &screen.grid[row];
+    if col >= line.len() {
+        return (row, col, row, col);
+    }
+    if !is_word_char(line[col].ch) {
+        return (row, col, row, col);
+    }
+    let mut start_col = col;
+    while start_col > 0 && is_word_char(line[start_col - 1].ch) {
+        start_col -= 1;
+    }
+    let mut end_col = col;
+    while end_col + 1 < line.len() && is_word_char(line[end_col + 1].ch) {
+        end_col += 1;
+    }
+    (row, start_col, row, end_col)
+}
+
+/// Full line at row in stream order: (start_row, start_col, end_row, end_col).
+fn selection_line_at(screen: &Screen, row: usize) -> (usize, usize, usize, usize) {
+    let end_col = if row < screen.grid.len() {
+        screen.grid[row].len().saturating_sub(1)
+    } else {
+        0
+    };
+    (row, 0, row, end_col)
+}
+
 // -----------------------------------------------------------------------------
 // AI mode and bar (command generation, suggest fix)
 // -----------------------------------------------------------------------------
+
+/// Step in the Configure API wizard.
+#[derive(Clone, Debug)]
+enum ConfigApiStep {
+    ChooseProvider { selected: usize },
+    EnterKey {
+        provider: AiBackend,
+        key_buffer: String,
+    },
+    Done { message: String },
+}
 
 #[derive(Clone, Debug)]
 enum AiMode {
@@ -789,17 +1261,32 @@ enum AiMode {
     Thinking,
     SuggestionReady { command: String },
     Error { message: String },
+    BackendPicker {
+        choices: Vec<BackendChoice>,
+        selected: usize,
+    },
+    ModelPicker {
+        backend: AiBackend,
+        models: Vec<String>,
+        selected: usize,
+    },
+    ConfigApiWizard { step: ConfigApiStep },
+    RemoveApiPicker {
+        backends: Vec<AiBackend>,
+        selected: usize,
+    },
 }
 
-const AI_BOX_WIDTH: usize = 58;
-const AI_BOX_HEIGHT: usize = 6;
+const AI_BOX_WIDTH: usize = 64;
+const AI_BOX_HEIGHT: usize = 8;
 
-/// Renders the AI command modal: a centered box with "Command instructions", input area, [X], and "Quick Question".
+/// Renders the AI command modal: clean centered box with header, input area, and footer.
 fn render_ai_bar(
     ai_mode: &AiMode,
     term_rows: usize,
     term_cols: usize,
     theme: &Theme,
+    current_model: Option<&str>,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     if matches!(ai_mode, AiMode::Idle) {
@@ -808,9 +1295,10 @@ fn render_ai_bar(
     let w = AI_BOX_WIDTH.min(term_cols.saturating_sub(2));
     let h = AI_BOX_HEIGHT.min(term_rows.saturating_sub(2));
     let start_col = term_cols.saturating_sub(w) / 2;
-    let start_row = term_rows.saturating_sub(h) / 2;
+    let start_row = term_rows.saturating_sub(h);
     let w_u = w as u16;
     let h_u = h as u16;
+    let inner_w = w.saturating_sub(2);
 
     let fg = crossterm::style::Color::Rgb {
         r: theme.default_foreground.0,
@@ -824,92 +1312,299 @@ fn render_ai_bar(
     };
     let dim = crossterm::style::Color::Rgb { r: 0x66, g: 0x66, b: 0x66 };
 
-    // Top border: ┌── Command instructions ────────── [X] ──┐
     let top_left = start_col as u16;
     let top_row = start_row as u16;
-    queue!(
-        stdout,
-        cursor::MoveTo(top_left, top_row),
-        crossterm::style::SetForegroundColor(fg),
-        crossterm::style::SetBackgroundColor(bg),
-        crossterm::style::Print('┌'),
-        crossterm::style::Print("─".repeat(w.saturating_sub(2))),
-        crossterm::style::Print('┐')
-    )?;
-    // Title and close on top line (overwrite part of the border line)
-    queue!(
-        stdout,
-        cursor::MoveTo(top_left + 2, top_row),
-        crossterm::style::Print(" Command instructions ")
-    )?;
-    queue!(
-        stdout,
-        cursor::MoveTo(top_left + w_u - 5, top_row),
-        crossterm::style::SetForegroundColor(dim),
-        crossterm::style::Print(" [X]"),
-        crossterm::style::SetForegroundColor(fg)
-    )?;
 
-    // Content lines
-    let (content_line1, content_line2) = match ai_mode {
+    // ─── Top border (rounded) ───
+    queue!(stdout, cursor::MoveTo(top_left, top_row), crossterm::style::SetForegroundColor(dim), crossterm::style::SetBackgroundColor(bg))?;
+    queue!(stdout, crossterm::style::Print('╭'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('╮'))?;
+
+    // Row 1: title + optional model name + close
+    let r1 = top_row + 1;
+    let title = match ai_mode {
+        AiMode::BackendPicker { .. } => "  Select backend",
+        AiMode::ModelPicker { .. } => "  Select model",
+        AiMode::ConfigApiWizard { .. } => "  Configure API",
+        AiMode::RemoveApiPicker { .. } => "  Remove API",
+        _ => "  Command instructions",
+    };
+    queue!(stdout, cursor::MoveTo(top_left, r1), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+    queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(title))?;
+    let mut used = title.len();
+    if let Some(model) = current_model {
+        let model_label = format!(" · {}", model);
+        let max_model = inner_w.saturating_sub(used).saturating_sub(6);
+        let show = if model_label.len() > max_model {
+            format!("{}…", &model_label[..max_model.saturating_sub(1)])
+        } else {
+            model_label
+        };
+        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&show))?;
+        used += show.len();
+    }
+    let gap = inner_w.saturating_sub(used).saturating_sub(6);
+    queue!(stdout, crossterm::style::SetForegroundColor(bg), crossterm::style::Print(" ".repeat(gap)))?;
+    queue!(stdout, cursor::MoveTo(top_left + w_u - 6, r1), crossterm::style::SetForegroundColor(dim), crossterm::style::Print(" Esc │"))?;
+
+    // Row 2: separator
+    let r2 = top_row + 2;
+    queue!(stdout, cursor::MoveTo(top_left, r2), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('├'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('┤'))?;
+
+    // Row 3: main content (input or message)
+    let r3 = top_row + 3;
+    let (line1, line2, show_placeholder) = match ai_mode {
         AiMode::PromptInput { buffer } => {
-            let max_len = w.saturating_sub(6);
+            let max_len = inner_w.saturating_sub(6);
             let display = if buffer.len() > max_len {
                 format!("{}…", &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..])
             } else {
                 buffer.clone()
             };
-            (format!("  {}_", display), String::new())
+            let line2 = current_model
+                .map(|m| {
+                    let s = format!("  model: {}", m);
+                    if s.len() > inner_w {
+                        format!("{}…", &s[..inner_w.saturating_sub(1)])
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            (format!("  › {}_", display), line2, buffer.is_empty())
         }
-        AiMode::Thinking => ("  Thinking…".to_string(), String::new()),
+        AiMode::Thinking => ("  Thinking…".to_string(), String::new(), false),
         AiMode::SuggestionReady { command } => {
-            let max_len = w.saturating_sub(6);
+            let max_len = inner_w.saturating_sub(4);
             let display = if command.len() > max_len {
                 format!("{}…", &command[..max_len.saturating_sub(1)])
             } else {
                 command.clone()
             };
-            (format!("  {}", display), "  Enter=run  Esc=dismiss".to_string())
+            (format!("  {}", display), "  Enter run · Esc dismiss".to_string(), false)
         }
         AiMode::Error { message } => {
-            let max_len = w.saturating_sub(8);
+            let max_len = inner_w.saturating_sub(10);
             let display = if message.len() > max_len {
                 format!("{}…", &message[..max_len.saturating_sub(1)])
             } else {
                 message.clone()
             };
-            (format!("  Error: {}", display), "  Esc to close".to_string())
+            (format!("  {}", display), "  Esc to close".to_string(), false)
         }
+        AiMode::BackendPicker { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
+        AiMode::ModelPicker { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
+        AiMode::RemoveApiPicker { .. } => (String::new(), "  Enter remove · Esc cancel".to_string(), false),
+        AiMode::ConfigApiWizard { step } => match step {
+            ConfigApiStep::ChooseProvider { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
+            ConfigApiStep::EnterKey { provider, key_buffer } => {
+                let prompt = format!("  API key for {}: {}_", provider, key_buffer);
+                (prompt, "  Enter save · Esc cancel".to_string(), false)
+            }
+            ConfigApiStep::Done { message } => {
+                let msg = if message.len() > inner_w.saturating_sub(4) {
+                    format!("{}…", &message[..inner_w.saturating_sub(4)])
+                } else {
+                    message.clone()
+                };
+                (format!("  {}", msg), "  Enter to close".to_string(), false)
+            }
+        },
         AiMode::Idle => unreachable!(),
     };
 
-    for (i, line) in [content_line1, content_line2].iter().enumerate() {
-        let r = top_row + 1 + i as u16;
-        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::Print('│'))?;
-        let padded = format!("{:<width$}", line, width = w.saturating_sub(2));
-        queue!(stdout, crossterm::style::Print(&padded))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+    let content_rows: usize = 4;
+    if let AiMode::BackendPicker { choices, selected } = ai_mode {
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|c| match c {
+                BackendChoice::Backend(b) => b.to_string(),
+                BackendChoice::ConfigureApi => "Configure API".to_string(),
+                BackendChoice::RemoveApi => "Remove API".to_string(),
+            })
+            .collect();
+        let visible_len = content_rows.saturating_sub(1).min(labels.len());
+        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let end = (start + visible_len).min(labels.len());
+        for (i, name) in labels[start..end].iter().enumerate() {
+            let row = top_row + 3 + i as u16;
+            let idx = start + i;
+            let max_name_len = inner_w.saturating_sub(6);
+            let truncated = if name.len() > max_name_len {
+                format!("{}…", &name[..max_name_len])
+            } else {
+                name.clone()
+            };
+            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            if idx == *selected {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            } else {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            }
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        }
+        let footer_row = top_row + 3 + visible_len as u16;
+        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
+            let r = top_row + 3 + i as u16;
+            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        }
+    } else if let AiMode::RemoveApiPicker { backends, selected } = ai_mode {
+        let labels: Vec<String> = backends.iter().map(|b| b.to_string()).collect();
+        let visible_len = content_rows.saturating_sub(1).min(labels.len());
+        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let end = (start + visible_len).min(labels.len());
+        for (i, name) in labels[start..end].iter().enumerate() {
+            let row = top_row + 3 + i as u16;
+            let idx = start + i;
+            let max_name_len = inner_w.saturating_sub(6);
+            let truncated = if name.len() > max_name_len {
+                format!("{}…", &name[..max_name_len])
+            } else {
+                name.clone()
+            };
+            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            if idx == *selected {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            } else {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            }
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        }
+        let footer_row = top_row + 3 + visible_len as u16;
+        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter remove · Esc cancel", width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
+            let r = top_row + 3 + i as u16;
+            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        }
+    } else if let AiMode::ConfigApiWizard { step: ConfigApiStep::ChooseProvider { selected } } = ai_mode {
+        const WIZARD_PROVIDERS: [&str; 3] = ["OpenAI", "Gemini", "Groq"];
+        let labels: Vec<String> = WIZARD_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
+        let visible_len = content_rows.saturating_sub(1).min(labels.len());
+        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let end = (start + visible_len).min(labels.len());
+        for (i, name) in labels[start..end].iter().enumerate() {
+            let row = top_row + 3 + i as u16;
+            let idx = start + i;
+            let max_name_len = inner_w.saturating_sub(6);
+            let truncated = if name.len() > max_name_len {
+                format!("{}…", &name[..max_name_len])
+            } else {
+                name.clone()
+            };
+            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            if idx == *selected {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            } else {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            }
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        }
+        let footer_row = top_row + 3 + visible_len as u16;
+        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
+            let r = top_row + 3 + i as u16;
+            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        }
+    } else if let AiMode::ConfigApiWizard { step: ConfigApiStep::EnterKey { .. } | ConfigApiStep::Done { .. } } = ai_mode {
+        queue!(stdout, cursor::MoveTo(top_left, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        let r4 = top_row + 4;
+        queue!(stdout, cursor::MoveTo(top_left, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        for i in 5..h.saturating_sub(1) {
+            let r = top_row + i as u16;
+            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        }
+    } else if let AiMode::ModelPicker { models, selected, .. } = ai_mode {
+        let visible_len = content_rows.saturating_sub(1).min(models.len());
+        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(models.len().saturating_sub(visible_len));
+        let end = (start + visible_len).min(models.len());
+        for (i, name) in models[start..end].iter().enumerate() {
+            let row = top_row + 3 + i as u16;
+            let idx = start + i;
+            let max_name_len = inner_w.saturating_sub(6);
+            let truncated = if name.len() > max_name_len {
+                format!("{}…", &name[..max_name_len])
+            } else {
+                name.clone()
+            };
+            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            if idx == *selected {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            } else {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(stdout, crossterm::style::Print(&truncated))?;
+            }
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        }
+        let footer_row = top_row + 3 + visible_len as u16;
+        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
+        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
+            let r = top_row + 3 + i as u16;
+            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
+            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        }
+    } else {
+        queue!(stdout, cursor::MoveTo(top_left, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        if show_placeholder {
+        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print("  › "))?;
+        queue!(stdout, crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0x55, g: 0x55, b: 0x55 }), crossterm::style::Print("Describe what you want to run…"))?;
+        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print('_'))?;
+        let used = 4 + 31 + 1;
+        queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used))))?;
+    } else {
+        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
     }
+    queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
 
-    // Empty middle row(s)
-    for i in 3..h.saturating_sub(1) {
+    // Row 4: optional second line
+    let r4 = top_row + 4;
+    queue!(stdout, cursor::MoveTo(top_left, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+    queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w)))?;
+    queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+
+    // Empty rows
+    for i in 5..h.saturating_sub(1) {
         let r = top_row + i as u16;
-        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::Print(" ".repeat(w.saturating_sub(2))))?;
+        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
         queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
     }
+    }
 
-    // Bottom row: Quick Question and arrow
+    // Bottom separator
     let bottom_row = top_row + h_u - 1;
-    queue!(stdout, cursor::MoveTo(top_left, bottom_row), crossterm::style::Print('└'))?;
-    queue!(stdout, crossterm::style::Print("─".repeat(w.saturating_sub(2))), crossterm::style::Print('┘'))?;
-    queue!(
-        stdout,
-        cursor::MoveTo(top_left + w_u.saturating_sub(20), bottom_row),
-        crossterm::style::SetForegroundColor(dim),
-        crossterm::style::Print(" Quick Question  ▲ "),
-        crossterm::style::SetForegroundColor(fg)
-    )?;
+    queue!(stdout, cursor::MoveTo(top_left, bottom_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('╰'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('╯'))?;
 
     stdout.flush()?;
     Ok(())
@@ -925,9 +1620,10 @@ fn render(
     art_height: usize,
     theme: &Theme,
     ai_bar_visible: bool,
+    current_model: Option<&str>,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
-    let (_term_rows, term_cols) = terminal::size()
+    let (term_rows, term_cols) = terminal::size()
         .map(|(c, r)| (r as usize, c as usize))
         .unwrap_or((24, 80));
     let art_line_list = art_lines();
@@ -952,11 +1648,12 @@ fn render(
     let mut last_fg = 255;
     let mut last_bg = 255;
     let mut last_bold = false;
-    let sel = selection.and_then(|s| (!s.is_empty()).then(|| s.normalized()));
-
     for (r, row) in screen.grid.iter().take(grid_rows).enumerate() {
         for (c, cell) in row.iter().enumerate() {
-            let in_selection = sel.map(|(r1, c1, r2, c2)| r >= r1 && r <= r2 && c >= c1 && c <= c2).unwrap_or(false);
+            let in_selection = selection
+                .filter(|s| !s.is_empty())
+                .map(|s| s.contains_cell(r, c))
+                .unwrap_or(false);
             let draw_r = top_offset + r;
             let draw_c = c;
 
@@ -1026,6 +1723,32 @@ fn render(
             queue!(stdout, cursor::MoveTo(draw_c as u16, draw_r as u16), crossterm::style::Print(cell.ch))?;
         }
     }
+    // Bottom left: show selected AI model name when set
+    if let Some(name) = current_model {
+        let bottom_row = (term_rows.saturating_sub(1)) as u16;
+        let label = format!(" {}", name);
+        let display = if label.len() > term_cols {
+            format!("{}…", &label[..term_cols.saturating_sub(1)])
+        } else {
+            label
+        };
+        queue!(stdout, cursor::MoveTo(0, bottom_row))?;
+        queue!(
+            stdout,
+            crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                r: theme.default_foreground.0,
+                g: theme.default_foreground.1,
+                b: theme.default_foreground.2,
+            }),
+            crossterm::style::SetBackgroundColor(crossterm::style::Color::Rgb {
+                r: theme.default_background.0,
+                g: theme.default_background.1,
+                b: theme.default_background.2,
+            })
+        )?;
+        queue!(stdout, crossterm::style::Print(&display))?;
+    }
+
     queue!(
         stdout,
         cursor::MoveTo(
@@ -1143,12 +1866,17 @@ fn main() -> io::Result<()> {
 
     execute!(stdout, event::EnableMouseCapture)?;
 
-    // Selection state: drag updates end; Ctrl+Shift+C copies.
+    // Selection state: drag updates end; Ctrl+Shift+C copies. Copy on release (traditional).
+    // Double-click = word, triple-click = line.
     let mut selection: Option<Selection> = None;
     let mut selecting = false;
+    let mut last_click: Option<(usize, usize, u8, Instant)> = None;
+    const DOUBLE_CLICK_MS: u64 = 400;
 
-    // AI command generation and suggest-fix
-    let ai_config = load_ai_config();
+    // AI command generation and suggest-fix (reload after wizard saves so new keys apply without restart)
+    let mut ai_config = load_ai_config();
+    let mut backend_override: Option<AiBackend> = None;
+    let mut model_override: Option<String> = None;
     let (ai_tx, ai_rx) = mpsc::channel();
     let mut ai_mode = AiMode::Idle;
     const CMD_SYSTEM: &str = "You are a shell assistant. Reply with exactly one shell command, no explanation, no markdown code blocks.";
@@ -1215,6 +1943,8 @@ fn main() -> io::Result<()> {
                                 };
                             }
                         }
+                        let mut exit_wizard_to_idle = false;
+                        let mut reload_ai_config = false;
                         match &mut ai_mode {
                             AiMode::PromptInput { buffer } => {
                                 match code {
@@ -1228,20 +1958,70 @@ fn main() -> io::Result<()> {
                                         let prompt = buffer.trim().to_string();
                                         if prompt.is_empty() {
                                             ai_mode = AiMode::Idle;
+                                        } else if prompt == "/model" || prompt == "/models" {
+                                            let choices = available_backends(&ai_config);
+                                            ai_mode = AiMode::BackendPicker {
+                                                choices,
+                                                selected: 0,
+                                            };
                                         } else {
-                                            let base_url = ai_config.base_url.clone();
-                                            let config_model = ai_config.model.clone();
+                                            let backend = backend_override.unwrap_or(ai_config.default_backend);
                                             let tx = ai_tx.clone();
+                                            let config = ai_config.clone();
+                                            let prompt_clone = prompt.clone();
+                                            let model_opt = model_override.clone().or_else(|| config.default_model.clone());
                                             thread::spawn(move || {
-                                                let model = match ollama_resolve_model(&base_url, config_model.as_deref()) {
-                                                    Ok(m) => m,
-                                                    Err(e) => {
-                                                        let _ = tx.send(Err(e));
-                                                        return;
+                                                let res = match backend {
+                                                    AiBackend::Ollama => {
+                                                        let model = match ollama_resolve_model(
+                                                            &config.ollama_base_url,
+                                                            model_opt.as_deref(),
+                                                        ) {
+                                                            Ok(m) => m,
+                                                            Err(e) => {
+                                                                let _ = tx.send(Err(e));
+                                                                return;
+                                                            }
+                                                        };
+                                                        let full_prompt = ollama_build_prompt(CMD_SYSTEM, &prompt_clone);
+                                                        ollama_generate(&config.ollama_base_url, &model, &full_prompt)
+                                                    }
+                                                    AiBackend::OpenAi => {
+                                                        let api_key = match config.openai_api_key() {
+                                                            Some(k) => k,
+                                                            None => {
+                                                                let _ = tx.send(Err("Set OPENAI_API_KEY or configure in /model → Configure API".to_string()));
+                                                                return;
+                                                            }
+                                                        };
+                                                        let model = model_opt.unwrap_or_else(|| "gpt-4o-mini".to_string());
+                                                        let base = config.openai_base_url();
+                                                        openai_generate(&base, &api_key, &model, CMD_SYSTEM, &prompt_clone)
+                                                    }
+                                                    AiBackend::Gemini => {
+                                                        let api_key = match config.gemini_api_key() {
+                                                            Some(k) => k,
+                                                            None => {
+                                                                let _ = tx.send(Err("Set GEMINI_API_KEY or configure in /model → Configure API".to_string()));
+                                                                return;
+                                                            }
+                                                        };
+                                                        let model = model_opt.unwrap_or_else(|| "gemini-2.0-flash".to_string());
+                                                        gemini_generate(&api_key, &model, CMD_SYSTEM, &prompt_clone)
+                                                    }
+                                                    AiBackend::Groq => {
+                                                        let api_key = match config.groq_api_key() {
+                                                            Some(k) => k,
+                                                            None => {
+                                                                let _ = tx.send(Err("Set GROQ_API_KEY or configure in /model → Configure API".to_string()));
+                                                                return;
+                                                            }
+                                                        };
+                                                        let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                                                        let base = config.groq_base_url();
+                                                        openai_generate(&base, &api_key, &model, CMD_SYSTEM, &prompt_clone)
                                                     }
                                                 };
-                                                let full_prompt = ollama_build_prompt(CMD_SYSTEM, &prompt);
-                                                let res = ollama_generate(&base_url, &model, &full_prompt);
                                                 let _ = tx.send(res);
                                             });
                                             ai_mode = AiMode::Thinking;
@@ -1274,7 +2054,221 @@ fn main() -> io::Result<()> {
                                     ai_mode = AiMode::Idle;
                                 }
                             }
+                            AiMode::BackendPicker { choices, selected } => {
+                                match code {
+                                    KeyCode::Up => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down => {
+                                        *selected = (*selected + 1).min(choices.len().saturating_sub(1));
+                                    }
+                                    KeyCode::Enter => {
+                                        let choice = choices[*selected].clone();
+                                        match choice {
+                                            BackendChoice::ConfigureApi => {
+                                                ai_mode = AiMode::ConfigApiWizard {
+                                                    step: ConfigApiStep::ChooseProvider { selected: 0 },
+                                                };
+                                            }
+                                            BackendChoice::RemoveApi => {
+                                                let backends: Vec<AiBackend> = [AiBackend::OpenAi, AiBackend::Gemini, AiBackend::Groq]
+                                                    .into_iter()
+                                                    .filter(|b| ai_config.is_configured(*b))
+                                                    .collect();
+                                                ai_mode = AiMode::RemoveApiPicker {
+                                                    backends,
+                                                    selected: 0,
+                                                };
+                                            }
+                                            BackendChoice::Backend(backend) => {
+                                                let models = match backend {
+                                                    AiBackend::Ollama => {
+                                                        match ollama_list_models(&ai_config.ollama_base_url) {
+                                                            Ok(list) if !list.is_empty() => list,
+                                                            Ok(_) => {
+                                                                ai_mode = AiMode::Error {
+                                                                    message: "No Ollama models. Pull one with: ollama pull <name>".to_string(),
+                                                                };
+                                                                continue;
+                                                            }
+                                                            Err(e) => {
+                                                                ai_mode = AiMode::Error { message: e };
+                                                                continue;
+                                                            }
+                                                        }
+                                                    }
+                                                    AiBackend::OpenAi => {
+                                                        let key = ai_config.openai_api_key().unwrap_or_default();
+                                                        openai_list_models(&ai_config.openai_base_url(), &key)
+                                                    }
+                                                    AiBackend::Gemini => gemini_list_models(),
+                                                    AiBackend::Groq => groq_list_models(),
+                                                };
+                                                ai_mode = AiMode::ModelPicker {
+                                                    backend,
+                                                    models,
+                                                    selected: 0,
+                                                };
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            AiMode::ModelPicker { backend, models, selected } => {
+                                match code {
+                                    KeyCode::Up => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down => {
+                                        *selected = (*selected + 1).min(models.len().saturating_sub(1));
+                                    }
+                                    KeyCode::Enter => {
+                                        let chosen = models[*selected].clone();
+                                        backend_override = Some(*backend);
+                                        model_override = Some(chosen);
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    KeyCode::Esc => {
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            AiMode::RemoveApiPicker { backends, selected } => {
+                                match code {
+                                    KeyCode::Up => {
+                                        *selected = selected.saturating_sub(1);
+                                    }
+                                    KeyCode::Down => {
+                                        *selected = (*selected + 1).min(backends.len().saturating_sub(1));
+                                    }
+                                    KeyCode::Enter => {
+                                        let backend = backends[*selected];
+                                        let provider_name = match backend {
+                                            AiBackend::OpenAi => "openai",
+                                            AiBackend::Gemini => "gemini",
+                                            AiBackend::Groq => "groq",
+                                            AiBackend::Ollama => "ollama",
+                                        };
+                                        match remove_provider_api_key(provider_name) {
+                                            Ok(()) => {
+                                                reload_ai_config = true;
+                                                ai_mode = AiMode::Idle;
+                                            }
+                                            Err(e) => {
+                                                ai_mode = AiMode::Error {
+                                                    message: format!("Remove failed: {}", e),
+                                                };
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            AiMode::ConfigApiWizard { step } => {
+                                match step {
+                                    ConfigApiStep::ChooseProvider { selected } => {
+                                        match code {
+                                            KeyCode::Up => {
+                                                *selected = selected.saturating_sub(1);
+                                            }
+                                            KeyCode::Down => {
+                                                *selected = (*selected + 1).min(2);
+                                            }
+                                            KeyCode::Enter => {
+                                                const WIZARD_BACKENDS: [AiBackend; 3] =
+                                                    [AiBackend::OpenAi, AiBackend::Gemini, AiBackend::Groq];
+                                                let provider = WIZARD_BACKENDS[*selected];
+                                                ai_mode = AiMode::ConfigApiWizard {
+                                                    step: ConfigApiStep::EnterKey {
+                                                        provider,
+                                                        key_buffer: String::new(),
+                                                    },
+                                                };
+                                            }
+                                            KeyCode::Esc => {
+                                                ai_mode = AiMode::Idle;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    ConfigApiStep::EnterKey { provider, key_buffer } => {
+                                        match code {
+                                            KeyCode::Char(c) if !c.is_control() => {
+                                                key_buffer.push(c);
+                                            }
+                                            KeyCode::Backspace => {
+                                                key_buffer.pop();
+                                            }
+                                            KeyCode::Enter => {
+                                                let key = key_buffer.trim();
+                                                if key.is_empty() {
+                                                    ai_mode = AiMode::ConfigApiWizard {
+                                                        step: ConfigApiStep::Done {
+                                                            message: format!(
+                                                                "Set {} env var or add key in config.",
+                                                                match provider {
+                                                                    AiBackend::OpenAi => "OPENAI_API_KEY",
+                                                                    AiBackend::Gemini => "GEMINI_API_KEY",
+                                                                    AiBackend::Groq => "GROQ_API_KEY",
+                                                                    AiBackend::Ollama => "N/A (Ollama needs no key)",
+                                                                }
+                                                            ),
+                                                        },
+                                                    };
+                                                } else {
+                                                    let provider_name = match provider {
+                                                        AiBackend::OpenAi => "openai",
+                                                        AiBackend::Gemini => "gemini",
+                                                        AiBackend::Groq => "groq",
+                                                        AiBackend::Ollama => "ollama",
+                                                    };
+                                                    match write_provider_api_key(provider_name, key) {
+                                                        Ok(()) => {
+                                                            reload_ai_config = true;
+                                                            ai_mode = AiMode::ConfigApiWizard {
+                                                                step: ConfigApiStep::Done {
+                                                                    message: format!("{} configured. Use /model to select.", provider),
+                                                                },
+                                                            };
+                                                        }
+                                                        Err(e) => {
+                                                            ai_mode = AiMode::ConfigApiWizard {
+                                                                step: ConfigApiStep::Done {
+                                                                    message: format!("Save failed: {}", e),
+                                                                },
+                                                            };
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Esc => {
+                                                ai_mode = AiMode::Idle;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    ConfigApiStep::Done { .. } => {
+                                        if code == KeyCode::Enter || code == KeyCode::Esc {
+                                            exit_wizard_to_idle = true;
+                                        }
+                                    }
+                                }
+                            }
                             AiMode::Thinking | AiMode::Idle => {}
+                        }
+                        if exit_wizard_to_idle {
+                            ai_mode = AiMode::Idle;
+                        }
+                        if reload_ai_config {
+                            ai_config = load_ai_config();
                         }
                         continue;
                     }
@@ -1292,12 +2286,54 @@ fn main() -> io::Result<()> {
                     match me.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             selecting = true;
-                            selection = Some(Selection {
-                                start_row: row,
-                                start_col: col,
-                                end_row: row,
-                                end_col: col,
-                            });
+                            if let Ok(s) = screen.lock() {
+                                let rows = s.rows;
+                                let cols = s.cols;
+                                let r = row.min(rows.saturating_sub(1));
+                                let c = col.min(cols.saturating_sub(1));
+                                let now = Instant::now();
+                                let click_count = match last_click {
+                                    Some((lr, lc, n, t))
+                                        if lr == r && lc == c
+                                            && now.duration_since(t).as_millis() < DOUBLE_CLICK_MS as u128 =>
+                                    {
+                                        (n + 1).min(3)
+                                    }
+                                    _ => 1,
+                                };
+                                last_click = Some((r, c, click_count, now));
+                                selection = Some(if click_count == 3 {
+                                    let (r1, c1, r2, c2) = selection_line_at(&s, r);
+                                    Selection {
+                                        start_row: r1,
+                                        start_col: c1,
+                                        end_row: r2,
+                                        end_col: c2,
+                                    }
+                                } else if click_count == 2 {
+                                    let (r1, c1, r2, c2) = selection_word_at(&s, r, c);
+                                    Selection {
+                                        start_row: r1,
+                                        start_col: c1,
+                                        end_row: r2,
+                                        end_col: c2,
+                                    }
+                                } else {
+                                    Selection {
+                                        start_row: r,
+                                        start_col: c,
+                                        end_row: r,
+                                        end_col: c,
+                                    }
+                                });
+                            } else {
+                                selection = Some(Selection {
+                                    start_row: row,
+                                    start_col: col,
+                                    end_row: row,
+                                    end_col: col,
+                                });
+                            }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
                             if selecting {
@@ -1308,6 +2344,16 @@ fn main() -> io::Result<()> {
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
+                            if let (Some(ref sel), Ok(s)) = (selection.as_ref(), screen.lock()) {
+                                if !sel.is_empty() {
+                                    let text = sel.extract_from(&s);
+                                    if !text.is_empty() {
+                                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                                            let _ = clip.set_text(&text);
+                                        }
+                                    }
+                                }
+                            }
                             selecting = false;
                         }
                         _ => {}
@@ -1344,15 +2390,21 @@ fn main() -> io::Result<()> {
         }
 
         // Redraw every frame: art at top, then terminal grid; AI modal overlays center when not Idle
+        let backend = backend_override.unwrap_or(ai_config.default_backend);
+        let current_model_display = model_override
+            .as_deref()
+            .or(ai_config.default_model.as_deref())
+            .map(|m| format!("{} · {}", backend, m));
+        let current_model = current_model_display.as_deref();
         if let (Ok(s), Ok(t)) = (screen.lock(), theme.lock()) {
-            let _ = render(&s, selection.as_ref(), art_height, &*t, false, &mut stdout);
+            let _ = render(&s, selection.as_ref(), art_height, &*t, false, current_model, &mut stdout);
         }
         if !matches!(ai_mode, AiMode::Idle) {
             let (term_rows, term_cols) = terminal::size()
                 .map(|(c, r)| (r as usize, c as usize))
                 .unwrap_or((24, 80));
             if let Ok(t) = theme.lock() {
-                let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, &mut stdout);
+                let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, current_model, &mut stdout);
             }
         }
     }
