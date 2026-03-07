@@ -11,14 +11,14 @@
 
 ### A minimal, AI-powered terminal emulator written in Rust
 
-![Version](https://img.shields.io/badge/version-0.1.0-00aaff?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.1.1-00aaff?style=for-the-badge)
 ![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-00e5a0?style=for-the-badge&logo=linux&logoColor=white)
 ![License](https://img.shields.io/badge/License-Personal%20Use-c084fc?style=for-the-badge)
 ![AI](https://img.shields.io/badge/AI-Ollama%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20Groq-ffd93d?style=for-the-badge&logo=openai&logoColor=black)
 ![PTY](https://img.shields.io/badge/PTY-Powered-00aaff?style=for-the-badge)
 
-<img src="images/Chameleon-version-0.1.0.png" width="280" alt="Chameleon v0.1.0" />
+<img src="images/Chameleon-version-0.1.1.png" width="280" alt="Chameleon v0.1.1" />
 
 </div>
 
