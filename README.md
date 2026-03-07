@@ -13,7 +13,7 @@
 
 ![Version](https://img.shields.io/badge/version-0.1.1-00aaff?style=for-the-badge)
 ![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-00e5a0?style=for-the-badge&logo=linux&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-00e5a0?style=for-the-badge&logo=linux&logoColor=white)
 ![License](https://img.shields.io/badge/License-Personal%20Use-c084fc?style=for-the-badge)
 ![AI](https://img.shields.io/badge/AI-Ollama%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20Groq-ffd93d?style=for-the-badge&logo=openai&logoColor=black)
 ![PTY](https://img.shields.io/badge/PTY-Powered-00aaff?style=for-the-badge)
@@ -43,7 +43,7 @@
 
 |     | Feature                   | Description                                                                            |
 | --- | ------------------------- | -------------------------------------------------------------------------------------- |
-| 🔌  | **PTY + Shell**           | Spawns your `$SHELL` (or `/bin/sh`) in a real pseudo-terminal with full signal support |
+| 🔌  | **PTY + Shell**           | Spawns your shell (Unix: `$SHELL`/`/bin/sh`; Windows: `cmd.exe`) in a real PTY with full signal support |
 | 🤖  | **AI Command Bar**        | Press `Ctrl+K` — type English, get a shell command. Ollama, OpenAI, Gemini, or Groq    |
 | 💬  | **Autosuggestions**       | Fish-style ghost text: history-first, then AI. Accept with Tab / Right / End           |
 | 🎨  | **VTE Parsing**           | Cursor movement, colors, bold, erase, scroll, CSI/ESC sequences                        |
@@ -63,23 +63,33 @@
 
 ### One command _(recommended)_
 
-No Rust or package managers. One command downloads the right binary and installs it.
+No Rust or package managers. One command downloads the right binary for your OS.
+
+**Linux & macOS**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Haroon966/Chameleon/main/install.sh | sh
 ```
 
-The script installs to `~/bin` (if in your PATH) or `/usr/local/bin`, then asks:
+- Installs to `~/bin` (if in PATH) or `/usr/local/bin`.
+- Asks: **Primary** (desktop entry, optional `update-alternatives` on Linux) or **Secondary** (just the binary).
 
-- **Primary (default terminal)** — Adds a desktop entry so you can set Chameleon as default in system Settings; on Linux, can register with `update-alternatives`.
-- **Secondary** — Just installs the binary; run `chameleon` when you want it.
+**Windows (PowerShell)**
 
-The script fetches releases from `Haroon966/Chameleon` by default. To use another repo: `CHAMELEON_GITHUB_REPO=owner/repo curl -sSL .../install.sh | sh`. To overwrite an existing install: `curl -sSL .../install.sh | sh -s -f`.
+```powershell
+irm https://raw.githubusercontent.com/Haroon966/Chameleon/main/install.ps1 | iex
+```
+
+- Installs to `%LOCALAPPDATA%\Programs\Chameleon` and optionally adds it to your user PATH.
+
+Overwrite existing install: Linux/macOS use `-f`: `curl -sSL .../install.sh | sh -s -f`.  
+To use another repo set `CHAMELEON_GITHUB_REPO=owner/repo` (or `$env:CHAMELEON_GITHUB_REPO` on Windows).
 
 ### Manual: prebuilt binary
 
-1. Download the archive for your platform from [Releases](https://github.com/<owner>/chameleon/releases).
-2. Extract and move the binary:
+1. Download the archive for your platform from [Releases](https://github.com/Haroon966/Chameleon/releases).
+
+2. **Linux / macOS:** Extract and put the binary in your PATH:
 
 ```bash
 tar -xzf chameleon-*.tar.gz
@@ -87,20 +97,18 @@ mv chameleon-*/chameleon ~/bin/
 # or: mv chameleon-*/chameleon /usr/local/bin/
 ```
 
-Ensure `~/bin` (or `/usr/local/bin`) is in your `PATH`.
+3. **Windows:** Extract the `.zip`, then copy `chameleon.exe` to a folder that is in your PATH (e.g. create `%LOCALAPPDATA%\Programs\Chameleon` and add it to PATH).
 
 ### Build from source
 
 Requires Rust (edition 2021).
 
 ```bash
-git clone https://github.com/<owner>/chameleon.git
-cd chameleon
+git clone https://github.com/Haroon966/Chameleon.git
+cd Chameleon
 cargo build --release
-./target/release/chameleon
+# Run: ./target/release/chameleon (Unix) or target\release\chameleon.exe (Windows)
 ```
-
-Releases are fetched from `Haroon966/Chameleon` by default; set `CHAMELEON_GITHUB_REPO` to use another repo.
 
 ---
 
@@ -238,7 +246,7 @@ api_key = "..."
 
 | Requirement           | Details                                                                          |
 | --------------------- | -------------------------------------------------------------------------------- |
-| **Platform**          | Linux or macOS (PTY requires Unix-like)                                          |
+| **Platform**          | Linux, macOS, or Windows (x86_64)                                                |
 | **AI** _(optional)_   | [Ollama](https://ollama.ai) with a model, or API key for OpenAI, Gemini, or Groq |
 | **Build from source** | Rust edition 2021                                                                |
 

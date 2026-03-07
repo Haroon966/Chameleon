@@ -113,10 +113,38 @@ jobs:
           name: ${{ matrix.target }}
           path: chameleon-*-${{ matrix.target }}.tar.gz
 
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Prepare zip
+        run: |
+          $version = "$env:GITHUB_REF" -replace 'refs/tags/', ''
+          $staging = "chameleon-${version}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force -Path $staging
+          Copy-Item "target\x86_64-pc-windows-msvc\release\chameleon.exe" "$staging\"
+          "Chameleon ${version}. Extract and run chameleon.exe." | Out-File -FilePath "$staging\README.txt" -Encoding utf8
+          Compress-Archive -Path $staging -DestinationPath "${staging}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-pc-windows-msvc
+          path: chameleon-*-x86_64-pc-windows-msvc.zip
+
   release:
     name: Create release
     runs-on: ubuntu-latest
-    needs: [build-linux, build-linux-aarch64, build-macos]
+    needs: [build-linux, build-linux-aarch64, build-macos, build-windows]
     permissions:
       contents: write
     steps:
@@ -126,12 +154,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Collect tarballs for release
+      - name: Collect release assets
         id: collect
         run: |
           {
             echo 'files<<EOF'
-            find artifacts -name '*.tar.gz' -type f
+            find artifacts \( -name '*.tar.gz' -o -name '*.zip' \) -type f
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
 

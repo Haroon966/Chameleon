@@ -474,7 +474,8 @@ fn completion_suffix_from_reply(full_prefix: &str, command_part: &str, reply: &s
 // -----------------------------------------------------------------------------
 
 /// Load command history from shell history files. Returns commands newest-first (first match = most recent).
-/// Tries $HISTFILE, then Fish, Zsh, and Bash paths under $HOME.
+/// Tries $HISTFILE, then Fish, Zsh, and Bash paths under $HOME. On Windows returns empty (no bash/zsh history).
+#[cfg(unix)]
 fn load_shell_history() -> Vec<String> {
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
     let histfile = std::env::var("HISTFILE").ok();
@@ -517,6 +518,11 @@ fn load_shell_history() -> Vec<String> {
             return commands;
         }
     }
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn load_shell_history() -> Vec<String> {
     Vec::new()
 }
 
@@ -2019,9 +2025,10 @@ fn art_lines() -> Vec<&'static str> {
 }
 
 // -----------------------------------------------------------------------------
-// Shell resolution (use SHELL only if the binary exists)
+// Shell resolution (use SHELL only if the binary exists; on Windows use COMSPEC)
 // -----------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn resolve_shell() -> String {
     let candidates: Vec<String> = std::env::var("SHELL")
         .into_iter()
@@ -2033,6 +2040,11 @@ fn resolve_shell() -> String {
         }
     }
     "/bin/sh".to_string()
+}
+
+#[cfg(windows)]
+fn resolve_shell() -> String {
+    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
 }
 
 // -----------------------------------------------------------------------------
