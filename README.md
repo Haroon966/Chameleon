@@ -9,91 +9,148 @@
  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
 ```
 
-### 🦎 A minimal, AI-powered terminal emulator written in Rust
+### A minimal, AI-powered terminal emulator written in Rust
 
----
-
-![Version](https://img.shields.io/badge/version-0.1.1-00aaff?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.1.0-00aaff?style=for-the-badge)
 ![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-00e5a0?style=for-the-badge&logo=linux&logoColor=white)
 ![License](https://img.shields.io/badge/License-Personal%20Use-c084fc?style=for-the-badge)
 ![AI](https://img.shields.io/badge/AI-Ollama%20%7C%20OpenAI%20%7C%20Gemini%20%7C%20Groq-ffd93d?style=for-the-badge&logo=openai&logoColor=black)
 ![PTY](https://img.shields.io/badge/PTY-Powered-00aaff?style=for-the-badge)
 
-<img src="images/Chameleon-version-0.1.1.png" width="280" alt="Chameleon v0.1.1" />
-
----
-
-**Chameleon** runs your shell in a PTY · parses escape sequences with VTE · renders via crossterm · brings **AI command suggestions** with `Ctrl+K`
-
-[📦 Install](#-install) · [✨ Features](#-features) · [⌨️ Key Bindings](#️-key-bindings) · [⚙️ Configuration](#️-configuration) · [🏗️ Architecture](#️-architecture--dependencies) · [📄 License](#-license)
+<img src="images/Chameleon-version-0.1.0.png" width="280" alt="Chameleon v0.1.0" />
 
 </div>
 
 ---
 
-## 📦 Install
+## Intro
 
-### Prebuilt Binary _(recommended)_
+**Chameleon** is a terminal emulator that runs your shell in a real PTY, parses escape sequences with VTE, and renders with crossterm. It adds **AI command suggestions** at `Ctrl+K`: type in plain English and get a shell command. Use it as your daily terminal or as a secondary one—install with a single command and choose how you want it.
 
-> No Rust or package managers required.
+---
 
-1. Download the archive for your platform from [Releases](https://github.com/<owner>/chameleon/releases) (e.g. `chameleon-linux-x86_64.tar.gz`).
+## What problem it solves
+
+- **No more tab‑switching for AI** — Get command suggestions and natural-language-to-shell help inside the terminal instead of opening a browser or another app.
+- **Forget fewer commands** — Fish-style ghost suggestions (history first, then AI) and prefix search over your shell history so you can repeat or tweak commands without memorizing.
+- **One terminal that adapts** — Minimal by default, no web UI or account; theme and AI backend live in a single config file you can edit and reload on the fly.
+- **Easy to try** — One-command install, no package manager or Rust required; pick “primary” (default terminal) or “secondary” when you run the installer.
+
+---
+
+## Features
+
+|     | Feature                   | Description                                                                            |
+| --- | ------------------------- | -------------------------------------------------------------------------------------- |
+| 🔌  | **PTY + Shell**           | Spawns your `$SHELL` (or `/bin/sh`) in a real pseudo-terminal with full signal support |
+| 🤖  | **AI Command Bar**        | Press `Ctrl+K` — type English, get a shell command. Ollama, OpenAI, Gemini, or Groq    |
+| 💬  | **Autosuggestions**       | Fish-style ghost text: history-first, then AI. Accept with Tab / Right / End           |
+| 🎨  | **VTE Parsing**           | Cursor movement, colors, bold, erase, scroll, CSI/ESC sequences                        |
+| 📐  | **Dynamic Resize**        | Window resize updates PTY size and redraws the screen seamlessly                       |
+| 📋  | **Mouse Copy**            | Click-drag to select; double-click word, triple-click line; auto-copy to clipboard     |
+| 🌈  | **Live Theming**          | Edit `config.toml` and theme reloads instantly via `Ctrl+Shift+T`                      |
+| 📝  | **Syntax highlighting**   | First word of the command line highlighted (e.g. command name in cyan)                 |
+| ⚙️  | **File-based config**     | `~/.config/chameleon/config.toml` for theme + AI; open with `Ctrl+Shift+T`             |
+| ⌨️  | **Smart tab completions** | Tab / Right / End = accept full suggestion; `Ctrl+Right` = accept one word             |
+| 🚀  | **No config required**    | Works out of the box; config is optional                                               |
+| 📜  | **Extensive history**     | Prefix search over shell history (bash/zsh/fish), newest first, deduped                |
+| 📌  | **Abbreviations**         | Type abbrev + space to expand (e.g. `gco ` → `git checkout `, `gst ` → `git status `)  |
+
+---
+
+## How to install easily
+
+### One command _(recommended)_
+
+No Rust or package managers. One command downloads the right binary and installs it.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Haroon966/Chameleon/main/install.sh | sh
+```
+
+The script installs to `~/bin` (if in your PATH) or `/usr/local/bin`, then asks:
+
+- **Primary (default terminal)** — Adds a desktop entry so you can set Chameleon as default in system Settings; on Linux, can register with `update-alternatives`.
+- **Secondary** — Just installs the binary; run `chameleon` when you want it.
+
+Replace `<owner>` with your GitHub org or username. To overwrite an existing install: `curl -sSL .../install.sh | sh -s -f`.
+
+### Manual: prebuilt binary
+
+1. Download the archive for your platform from [Releases](https://github.com/<owner>/chameleon/releases).
 2. Extract and move the binary:
 
 ```bash
 tar -xzf chameleon-*.tar.gz
 mv chameleon-*/chameleon ~/bin/
-
-# Or system-wide:
-mv chameleon-*/chameleon /usr/local/bin/
+# or: mv chameleon-*/chameleon /usr/local/bin/
 ```
 
-Ensure `~/bin` is in your `PATH` (or use `/usr/local/bin`).
+Ensure `~/bin` (or `/usr/local/bin`) is in your `PATH`.
 
-### Build from Source
+### Build from source
 
-> Requires Rust edition 2021
+Requires Rust (edition 2021).
 
 ```bash
 git clone https://github.com/<owner>/chameleon.git
 cd chameleon
 cargo build --release
-
-# Run
 ./target/release/chameleon
-# or
-cargo run
 ```
 
-> Replace `<owner>` with the actual GitHub org or username if cloning from elsewhere.
+Replace `<owner>` with the actual GitHub org or username.
 
 ---
 
-## ✨ Features
+## Credit
 
-|     | Feature            | Description                                                                                    |
-| --- | ------------------ | ---------------------------------------------------------------------------------------------- |
-| 🔌  | **PTY + Shell**    | Spawns your `$SHELL` (or `/bin/sh`) in a real pseudo-terminal with full signal support         |
-| 🎨  | **VTE Parsing**    | Cursor movement, 8 standard colors, bold, erase, scroll, CSI/ESC sequences                     |
-| 🤖  | **AI Command Bar** | Press `Ctrl+K` — type English, get a shell command. Powered by Ollama, OpenAI, Gemini, or Groq |
-| 📐  | **Dynamic Resize** | Window resize updates PTY size and redraws the screen seamlessly                               |
-| 📋  | **Mouse Copy**     | Click-drag to select · double-click word · triple-click line · copies to clipboard             |
-| 🌈  | **Live Theming**   | Edit `config.toml` and theme reloads instantly via `Ctrl+Shift+T`                              |
+Chameleon is built with:
+
+- **[Rust](https://www.rust-lang.org/)** — language and toolchain
+- **[crossterm](https://github.com/crossterm-rs/crossterm)** — terminal I/O, raw mode, display, mouse
+- **[portable-pty](https://github.com/nicowilliams/portable-pty)** — cross-platform PTY
+- **[vte](https://github.com/alacritty/vte)** — ANSI/VT100 escape sequence parsing
+- **AI backends** — [Ollama](https://ollama.ai), OpenAI, Google Gemini, Groq (optional)
 
 ---
 
-## ⌨️ Key Bindings
+## License
 
-### Chameleon Shortcuts
+Personal and non-commercial use is **free**.  
+Modification, rebranding, and resale require **written permission** from the copyright holder.
 
-| Shortcut               | Action                                               |
-| ---------------------- | ---------------------------------------------------- |
-| `Ctrl` + `K`           | 🤖 Open AI command bar                               |
-| `Ctrl` + `Shift` + `T` | 🎨 Open config in `$EDITOR` and reload theme on save |
-| `Ctrl` + `Shift` + `C` | 📋 Copy selection to system clipboard                |
+See [LICENSE](LICENSE) in the project root.
 
-### Shell Signals
+---
+
+## Key bindings
+
+### Chameleon shortcuts
+
+| Shortcut                | Action                                   |
+| ----------------------- | ---------------------------------------- |
+| `Ctrl` + `K`            | Open AI command bar                      |
+| `Ctrl` + `Shift` + `T`  | Open config in `$EDITOR`, reload on save |
+| `Ctrl` + `Shift` + `C`  | Copy selection to clipboard              |
+| `Tab` / `Right` / `End` | Accept full ghost suggestion             |
+| `Ctrl` + `Right`        | Accept one word of ghost suggestion      |
+
+### Abbreviations (type then space)
+
+| Abbrev        | Expands to      | Abbrev     | Expands to    |
+| ------------- | --------------- | ---------- | ------------- |
+| `gco `        | `git checkout ` | `gpush `   | `git push `   |
+| `gst `        | `git status `   | `gpull `   | `git pull `   |
+| `gci `        | `git commit `   | `gmerge `  | `git merge `  |
+| `gbr `        | `git branch `   | `gfetch `  | `git fetch `  |
+| `glog `       | `git log `      | `gshow `   | `git show `   |
+| `gdiff `      | `git diff `     | `grebase ` | `git rebase ` |
+| `gadd `       | `git add `      | `greset `  | `git reset `  |
+| `ll ` / `la ` | `ls -la `       |            |               |
+
+### Shell signals
 
 | Shortcut     | Action                         |
 | ------------ | ------------------------------ |
@@ -103,7 +160,7 @@ cargo run
 | `Ctrl` + `\` | Send `SIGQUIT`                 |
 | `Esc`        | Dismiss AI bar / pickers       |
 
-> **Note:** Standard keys — arrows, Tab, Enter, Backspace, Home, End, Page Up/Down, Delete, Insert — are all passed through to the shell unchanged.
+Standard keys (arrows, Tab, Enter, Backspace, Home, End, Page Up/Down, Delete, Insert) are passed through to the shell.
 
 ### Mouse
 
@@ -116,13 +173,11 @@ cargo run
 
 ---
 
-## 🤖 AI Command Bar
+## AI command bar
 
-```
-Ctrl+K  →  type your prompt  →  Enter to run  ·  Esc to dismiss
-```
+`Ctrl+K` → type your prompt → Enter to run · Esc to dismiss
 
-**Example flow:**
+**Example:**
 
 ```
 ❯ ~/projects  ^K
@@ -133,48 +188,29 @@ Ctrl+K  →  type your prompt  →  Enter to run  ·  Esc to dismiss
      [Enter to run · Esc to dismiss]
 ```
 
-**Switching models:** Type `/model` or `/models` in the AI bar to open the backend picker:
-
-```
-/model  →  choose backend (Ollama · OpenAI · Gemini · Groq)  →  pick a model
-```
-
-**Managing API keys** from inside the AI bar:
-
-- **Configure API** — add or change an API key
-- **Remove API** — remove a provider's key
+- **Switch models:** Type `/model` or `/models` in the AI bar to choose backend (Ollama, OpenAI, Gemini, Groq) and model.
+- **API keys:** Use “Configure API” or “Remove API” from inside the AI bar.
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-**Location:** `~/.config/chameleon/config.toml`
-_(or `$XDG_CONFIG_HOME/chameleon/config.toml` if set)_
+**Location:** `~/.config/chameleon/config.toml` (or `$XDG_CONFIG_HOME/chameleon/config.toml`)
 
-The config file is created automatically the first time you press `Ctrl+Shift+T` (config directory and a default `config.toml` are created if missing).
-
-> **Quick edit:** Press `Ctrl+Shift+T` inside Chameleon to open the config in your `$EDITOR` (or `$VISUAL`, or `nano` if unset). Save and exit — theme reloads immediately.
+The file is created the first time you press `Ctrl+Shift+T`. Save and exit — theme reloads immediately.
 
 ```toml
-# ──────────────────────────────────────
-# THEME
-# ──────────────────────────────────────
 [theme]
-default_foreground = "#cccccc"     # text color
-default_background = "#1e1e1e"     # terminal background
-background_opacity = 0.95          # 0.0 transparent → 1.0 opaque
-font_size          = 14            # points (hint; host may override)
+default_foreground = "#cccccc"
+default_background = "#1e1e1e"
+background_opacity = 0.95
+font_size          = 14
 
-# ──────────────────────────────────────
-# AI
-# ──────────────────────────────────────
 [ai]
-backend  = "ollama"                         # ollama | openai | gemini | groq
-base_url = "http://127.0.0.1:11434"        # Ollama server URL
+backend  = "ollama"
+base_url = "http://127.0.0.1:11434"
 model    = "llama3.2:latest"
 
-# API keys — env vars are preferred over storing here
-# OPENAI_API_KEY / GEMINI_API_KEY / GROQ_API_KEY
 [ai.providers.openai]
 api_key = "sk-..."
 
@@ -185,94 +221,33 @@ api_key = "..."
 api_key = "..."
 ```
 
-### Theme Options
-
-| Option               | Description                          | Default     |
-| -------------------- | ------------------------------------ | ----------- |
-| `default_foreground` | Text color (hex)                     | `"#cccccc"` |
-| `default_background` | Background color (hex)               | `"#1e1e1e"` |
-| `background_opacity` | `0.0` = transparent · `1.0` = opaque | `0.95`      |
-| `font_size`          | Font size in points (clamped 6–72)   | `14`        |
-
-### AI Options
-
-| Option     | Description         | Example                    |
-| ---------- | ------------------- | -------------------------- |
-| `backend`  | Default AI provider | `"ollama"`                 |
-| `base_url` | Ollama server URL   | `"http://127.0.0.1:11434"` |
-| `model`    | Default model       | `"llama3.2:latest"`        |
-
-### API Key Environment Variables
-
-| Provider | Environment Variable |
-| -------- | -------------------- |
-| OpenAI   | `OPENAI_API_KEY`     |
-| Gemini   | `GEMINI_API_KEY`     |
-| Groq     | `GROQ_API_KEY`       |
+**Theme:** `default_foreground`, `default_background` (hex), `background_opacity` (0–1), `font_size` (6–72).  
+**AI:** Set `backend`, `base_url` (Ollama), `model`. Prefer env vars: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`.
 
 ---
 
-## 🏗️ Architecture & Dependencies
+## Architecture & dependencies
 
-### Thread Model
+**Thread model:** Main thread (crossterm raw mode, keyboard, resize, writes to PTY) and reader thread (reads PTY, VTE parser, screen buffer, redraw). Resize updates PTY size and triggers full redraw.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CHAMELEON PROCESS                        │
-│                                                                 │
-│  ┌──────────────────────┐      ┌──────────────────────────┐    │
-│  │     MAIN THREAD      │      │      READER THREAD        │    │
-│  │                      │      │                           │    │
-│  │  • Crossterm raw     │      │  • Reads PTY master       │    │
-│  │    mode + alt screen │      │  • Feeds vte::Parser      │    │
-│  │  • Keyboard & resize │◄────►│  • Updates screen buffer  │    │
-│  │    event loop        │      │    via Perform impl       │    │
-│  │  • Writes input to   │      │  • Triggers redraw        │    │
-│  │    PTY master        │      │                           │    │
-│  │  • Redraws on dirty  │      └──────────────────────────┘    │
-│  └──────────────────────┘                                       │
-│                                                                 │
-│  RESIZE: PTY size updated → buffer resized → full redraw        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Dependencies
-
-| Crate                 | Role                                          |
-| --------------------- | --------------------------------------------- |
-| `crossterm`           | Terminal I/O, raw mode, display, mouse        |
-| `portable-pty`        | Cross-platform PTY support                    |
-| `vte`                 | ANSI/VT100 escape sequence parsing            |
-| `arboard`             | System clipboard (copy)                       |
-| `ureq` + `serde_json` | HTTP calls to Ollama / OpenAI / Gemini / Groq |
-| `serde` + `toml`      | Config file parsing                           |
-| `directories`         | XDG-aware config path (`~/.config/chameleon`) |
+**Crates:** `crossterm` (I/O, display, mouse), `portable-pty` (PTY), `vte` (escape parsing), `arboard` (clipboard), `ureq` + `serde_json` (AI HTTP), `serde` + `toml` (config), `directories` (XDG config path).
 
 ---
 
-## 📋 Requirements
+## Requirements
 
-| Requirement              | Details                                                                                 |
-| ------------------------ | --------------------------------------------------------------------------------------- |
-| 🐧 **Platform**          | Linux or macOS (PTY requires Unix-like environment)                                     |
-| 🤖 **AI** _(optional)_   | [Ollama](https://ollama.ai) with ≥1 model **or** an API key for OpenAI, Gemini, or Groq |
-| 🦀 **Build from source** | Rust edition 2021                                                                       |
-
----
-
-## 📄 License
-
-Personal and non-commercial use is **free**.
-Modification, rebranding, and resale require **written permission** from the copyright holder.
-
-See [`LICENSE`](LICENSE) in the project root.
+| Requirement           | Details                                                                          |
+| --------------------- | -------------------------------------------------------------------------------- |
+| **Platform**          | Linux or macOS (PTY requires Unix-like)                                          |
+| **AI** _(optional)_   | [Ollama](https://ollama.ai) with a model, or API key for OpenAI, Gemini, or Groq |
+| **Build from source** | Rust edition 2021                                                                |
 
 ---
 
 <div align="center">
 
-**🦎 Chameleon — A terminal that adapts to you**
+**Chameleon — A terminal that adapts to you**
 
-_Built with ♥ in Rust · PTY + VTE + crossterm_
+_Built in Rust · PTY + VTE + crossterm_
 
 </div>

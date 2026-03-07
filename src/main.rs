@@ -7,7 +7,9 @@
 //!   Perform impl to update the shared screen buffer; then signals redraw.
 //! - On resize: update PTY size and clear/redraw.
 
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -406,6 +408,144 @@ fn strip_code_blocks(text: &str) -> String {
         .unwrap_or(text.as_str())
         .to_string();
     text
+}
+
+// -----------------------------------------------------------------------------
+// Abbreviations: expand on space (e.g. "gco " -> "git checkout ")
+// -----------------------------------------------------------------------------
+
+const ABBREVS: &[(&str, &str)] = &[
+    ("gco", "git checkout "),
+    ("gst", "git status "),
+    ("gci", "git commit "),
+    ("gbr", "git branch "),
+    ("glog", "git log "),
+    ("gdiff", "git diff "),
+    ("gadd", "git add "),
+    ("gpush", "git push "),
+    ("gpull", "git pull "),
+    ("gmerge", "git merge "),
+    ("gfetch", "git fetch "),
+    ("gshow", "git show "),
+    ("grebase", "git rebase "),
+    ("greset", "git reset "),
+    ("ll", "ls -la "),
+    ("la", "ls -la "),
+];
+
+fn expand_abbrev(word: &str) -> Option<&'static str> {
+    let word = word.trim();
+    ABBREVS
+        .iter()
+        .find(|(abbr, _)| *abbr == word)
+        .map(|(_, expansion)| *expansion)
+}
+
+/// From a terminal line (possibly with shell prompt), return the part that is the command to complete.
+/// E.g. "user@host:~$ git clo" -> "git clo"; "git clo" -> "git clo".
+fn command_part_of_line(line: &str) -> &str {
+    let line = line.trim();
+    for sep in [" $ ", " # ", "> ", "] "] {
+        if let Some(i) = line.rfind(sep) {
+            return line[i + sep.len()..].trim_start();
+        }
+    }
+    line.trim_start()
+}
+
+/// Given the full line prefix and the AI reply (full completed command), return the suffix to append.
+fn completion_suffix_from_reply(full_prefix: &str, command_part: &str, reply: &str) -> String {
+    let text = strip_code_blocks(&reply.trim().to_string());
+    if text.is_empty() {
+        return String::new();
+    }
+    // Reply should be the full command; strip the part user already typed to get suffix.
+    if text.starts_with(command_part) {
+        text[command_part.len()..].trim_start().to_string()
+    } else if text.starts_with(full_prefix.trim()) {
+        text[full_prefix.trim().len()..].trim_start().to_string()
+    } else {
+        text
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Fish-style history: load shell history and suggest from it (newest match first)
+// -----------------------------------------------------------------------------
+
+/// Load command history from shell history files. Returns commands newest-first (first match = most recent).
+/// Tries $HISTFILE, then Fish, Zsh, and Bash paths under $HOME.
+fn load_shell_history() -> Vec<String> {
+    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty());
+    let histfile = std::env::var("HISTFILE").ok();
+
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(h) = &histfile {
+        paths.push(h.clone());
+    }
+    if let Some(h) = &home {
+        paths.push(format!("{}/.local/share/fish/fish_history", h));
+        paths.push(format!("{}/.zsh_history", h));
+        paths.push(format!("{}/.bash_history", h));
+    }
+
+    for path in paths {
+        if path.is_empty() || !Path::new(&path).exists() {
+            continue;
+        }
+        if let Ok(content) = fs::read_to_string(&path) {
+            let mut commands = Vec::new();
+            let mut seen = std::collections::HashSet::<String>::new();
+            let is_fish = path.contains("fish");
+            let is_zsh = path.contains("zsh");
+            for line in content.lines().rev() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let cmd = if is_fish {
+                    line.strip_prefix("- cmd:").map(|s| s.trim().trim_matches('"')).unwrap_or("").trim()
+                } else if is_zsh {
+                    line.rfind(';').map(|i| line[i + 1..].trim()).unwrap_or(line)
+                } else {
+                    line
+                };
+                if !cmd.is_empty() && seen.insert(cmd.to_string()) {
+                    commands.push(cmd.to_string());
+                }
+            }
+            return commands;
+        }
+    }
+    Vec::new()
+}
+
+/// Split suffix into first word (including one trailing space if present) and the rest.
+fn split_first_word(suffix: &str) -> (String, String) {
+    let s = suffix.trim_start();
+    let word: String = s.chars().take_while(|c| !c.is_whitespace()).collect();
+    let after_word: String = s.chars().skip(word.len()).collect();
+    let rest = after_word.trim_start().to_string();
+    let to_inject = if after_word != rest {
+        format!("{} ", word)
+    } else {
+        word
+    };
+    (to_inject, rest)
+}
+
+/// Find the newest history entry that starts with `prefix` and is longer than prefix. Returns the suffix to append.
+fn history_suggestion(history: &[String], command_part: &str) -> Option<String> {
+    if command_part.is_empty() {
+        return None;
+    }
+    for cmd in history {
+        let cmd = cmd.trim();
+        if cmd.starts_with(command_part) && cmd.len() > command_part.len() {
+            return Some(cmd[command_part.len()..].to_string());
+        }
+    }
+    None
 }
 
 /// OpenAI (and compatible) chat completions; returns single message content.
@@ -900,6 +1040,16 @@ impl Screen {
         }
     }
 
+    /// Text from start of current row up to (and not including) cursor. Used for ghost completion prefix.
+    fn line_prefix_at_cursor(&self) -> String {
+        if self.cursor_row >= self.grid.len() {
+            return String::new();
+        }
+        let row = &self.grid[self.cursor_row];
+        let end = self.cursor_col.min(row.len());
+        row[..end].iter().map(|c| c.ch).collect()
+    }
+
     /// Last N rows of the grid as plain text (trimmed, newline-joined). Reserved for future use.
     #[allow(dead_code)]
     fn get_recent_text(&self, last_n_rows: usize) -> String {
@@ -935,12 +1085,20 @@ fn params_to_vec(params: &Params) -> Vec<u16> {
 
 struct TerminalPerform {
     screen: Arc<Mutex<Screen>>,
+    dirty: Arc<AtomicBool>,
+}
+
+impl TerminalPerform {
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Perform for TerminalPerform {
     fn print(&mut self, c: char) {
         if let Ok(mut s) = self.screen.lock() {
             s.put_char(c);
+            self.mark_dirty();
         }
     }
 
@@ -978,6 +1136,7 @@ impl Perform for TerminalPerform {
                 }
                 _ => {}
             }
+            self.mark_dirty();
         }
     }
 
@@ -1084,6 +1243,7 @@ impl Perform for TerminalPerform {
                 }
                 _ => {}
             }
+            self.mark_dirty();
         }
     }
 
@@ -1129,6 +1289,7 @@ impl Perform for TerminalPerform {
                 }
                 _ => {}
             }
+            self.mark_dirty();
         }
     }
 }
@@ -1277,6 +1438,13 @@ enum AiMode {
     },
 }
 
+/// Ghost text suggestion: suffix to show after cursor, and prefix it was generated for (for invalidation).
+#[derive(Clone, Debug)]
+struct GhostSuggestion {
+    suffix: String,
+    for_prefix: String,
+}
+
 const AI_BOX_WIDTH: usize = 64;
 const AI_BOX_HEIGHT: usize = 8;
 
@@ -1287,6 +1455,7 @@ fn render_ai_bar(
     term_cols: usize,
     theme: &Theme,
     current_model: Option<&str>,
+    ai_bar_ghost: Option<&GhostSuggestion>,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     if matches!(ai_mode, AiMode::Idle) {
@@ -1582,8 +1751,29 @@ fn render_ai_bar(
         queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print('_'))?;
         let used = 4 + 31 + 1;
         queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used))))?;
-    } else {
-        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+    } else if let (AiMode::PromptInput { buffer }, Some(g)) = (ai_mode, ai_bar_ghost) {
+            if buffer.trim() == g.for_prefix {
+                let max_len = inner_w.saturating_sub(6);
+                let display = if buffer.len() > max_len {
+                    format!("{}…", &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..])
+                } else {
+                    buffer.clone()
+                };
+                let prefix_str = format!("  › {}_", display);
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&prefix_str))?;
+                let ghost_len = inner_w.saturating_sub(prefix_str.len());
+                let suffix_display: String = g.suffix.chars().take(ghost_len).collect();
+                if !suffix_display.is_empty() {
+                    queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&suffix_display))?;
+                }
+                let used = prefix_str.len() + suffix_display.len();
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used))))?;
+            } else {
+                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+            }
+        } else {
+            queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+        }
     }
     queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
 
@@ -1599,7 +1789,6 @@ fn render_ai_bar(
         queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
         queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
         queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
-    }
     }
 
     // Bottom separator
@@ -1621,6 +1810,8 @@ fn render(
     theme: &Theme,
     ai_bar_visible: bool,
     current_model: Option<&str>,
+    ghost: Option<&GhostSuggestion>,
+    input_line_command_prefix: Option<&str>, // command part from shadow_line so ghost shows immediately when PTY echo is one frame behind
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     let (term_rows, term_cols) = terminal::size()
@@ -1649,6 +1840,21 @@ fn render(
     let mut last_bg = 255;
     let mut last_bold = false;
     for (r, row) in screen.grid.iter().take(grid_rows).enumerate() {
+        // Syntax highlighting: first word of command on input line (last row) in a distinct color
+        let (first_word_start_col, first_word_end_col) = if r == grid_rows.saturating_sub(1) {
+            let line: String = row.iter().map(|cell| cell.ch).collect();
+            let trimmed = line.trim_start();
+            let cmd = command_part_of_line(trimmed);
+            let first_word = cmd.split_whitespace().next().unwrap_or("");
+            let leading = line.len().saturating_sub(trimmed.len());
+            let cmd_start = trimmed.find(cmd).unwrap_or(0);
+            let start = leading + cmd_start;
+            let end = start + first_word.chars().count();
+            (start, end)
+        } else {
+            (0, 0)
+        };
+
         for (c, cell) in row.iter().enumerate() {
             let in_selection = selection
                 .filter(|s| !s.is_empty())
@@ -1668,7 +1874,12 @@ fn render(
                 last_bg = 255;
                 last_bold = false;
             } else if cell.fg != last_fg || cell.bg != last_bg || cell.bold != last_bold {
-                let fg = match cell.fg {
+                let syntax_highlight_first_word =
+                    r == grid_rows.saturating_sub(1) && c >= first_word_start_col && c < first_word_end_col;
+                let fg = if syntax_highlight_first_word {
+                    crossterm::style::Color::DarkCyan
+                } else {
+                    match cell.fg {
                     0 => crossterm::style::Color::Black,
                     1 => crossterm::style::Color::DarkRed,
                     2 => crossterm::style::Color::DarkGreen,
@@ -1686,6 +1897,7 @@ fn render(
                         g: theme.default_foreground.1,
                         b: theme.default_foreground.2,
                     },
+                }
                 };
                 let bg = match cell.bg {
                     0 => crossterm::style::Color::Rgb {
@@ -1749,6 +1961,34 @@ fn render(
         queue!(stdout, crossterm::style::Print(&display))?;
     }
 
+    // Ghost text overlay: dimmed suggestion after cursor (on the line where the cursor is, when command part matches).
+    // Show on the current cursor line, not only "last row" — at shell prompt the cursor is usually on row 0.
+    // Use input_line_command_prefix (main-thread shadow) so ghost appears immediately on keypress even if PTY echo is one frame behind.
+    if let Some(g) = ghost {
+        let line_at_cursor = screen.line_prefix_at_cursor();
+        let screen_prefix = command_part_of_line(line_at_cursor.trim());
+        let prefix_matches = screen_prefix == g.for_prefix
+            || input_line_command_prefix.map(|p| p == g.for_prefix).unwrap_or(false);
+        if prefix_matches
+            && screen.cursor_row < grid_rows
+            && screen.cursor_col < screen.cols
+        {
+            let dim = crossterm::style::Color::Rgb { r: 0x66, g: 0x66, b: 0x66 };
+            let max_suffix_len = screen.cols.saturating_sub(screen.cursor_col);
+            let suffix: String = g.suffix.chars().take(max_suffix_len).collect();
+            let ghost_row = (top_offset + screen.cursor_row) as u16;
+            let mut col = screen.cursor_col as u16;
+            queue!(stdout, crossterm::style::SetForegroundColor(dim))?;
+            for ch in suffix.chars() {
+                if col >= screen.cols as u16 {
+                    break;
+                }
+                queue!(stdout, cursor::MoveTo(col, ghost_row), crossterm::style::Print(ch))?;
+                col += 1;
+            }
+        }
+    }
+
     queue!(
         stdout,
         cursor::MoveTo(
@@ -1766,16 +2006,33 @@ fn render(
 // -----------------------------------------------------------------------------
 
 const WELCOME_ART: &str = r#"
-  ██████╗ ██╗  ██╗ █████╗ ███╗   ███╗███████╗██╗     ███████╗ ██████╗ ███╗   ██╗
- ██╔════╝ ██║  ██║██╔══██╗████╗ ████║██╔════╝██║     ██╔════╝██╔═══██╗████╗  ██║
- ██║  ███╗███████║███████║██╔████╔██║█████╗  ██║     █████╗  ██║   ██║██╔██╗ ██║
- ██║   ██║██╔══██║██╔══██║██║╚██╔╝██║██╔══╝  ██║     ██╔══╝  ██║   ██║██║╚██╗██║
- ╚██████╔╝██║  ██║██║  ██║██║ ╚═╝ ██║███████╗███████╗███████╗╚██████╔╝██║ ╚████║
-  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
+ ██████╗██╗  ██╗ █████╗ ███╗   ███╗███████╗██╗     ███████╗ ██████╗ ███╗   ██╗
+██╔════╝██║  ██║██╔══██╗████╗ ████║██╔════╝██║     ██╔════╝██╔═══██╗████╗  ██║
+██║     ███████║███████║██╔████╔██║█████╗  ██║     █████╗  ██║   ██║██╔██╗ ██║
+██║     ██╔══██║██╔══██║██║╚██╔╝██║██╔══╝  ██║     ██╔══╝  ██║   ██║██║╚██╗██║
+╚██████╗██║  ██║██║  ██║██║ ╚═╝ ██║███████╗███████╗███████╗╚██████╔╝██║ ╚████║
+ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝
 "#;
 
 fn art_lines() -> Vec<&'static str> {
     WELCOME_ART.trim_start_matches('\n').lines().collect()
+}
+
+// -----------------------------------------------------------------------------
+// Shell resolution (use SHELL only if the binary exists)
+// -----------------------------------------------------------------------------
+
+fn resolve_shell() -> String {
+    let candidates: Vec<String> = std::env::var("SHELL")
+        .into_iter()
+        .chain(["/bin/bash".into(), "/bin/sh".into()])
+        .collect();
+    for path in candidates {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    "/bin/sh".to_string()
 }
 
 // -----------------------------------------------------------------------------
@@ -1820,7 +2077,7 @@ fn main() -> io::Result<()> {
         })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell = resolve_shell();
     let cmd = CommandBuilder::new(shell.clone());
     let mut child = pair
         .slave
@@ -1836,8 +2093,10 @@ fn main() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     let screen = Arc::new(Mutex::new(Screen::new(rows, cols)));
+    let screen_dirty = Arc::new(AtomicBool::new(true)); // true so we draw once at start
     let performer = Arc::new(Mutex::new(TerminalPerform {
         screen: Arc::clone(&screen),
+        dirty: Arc::clone(&screen_dirty),
     }));
     let running = Arc::new(AtomicBool::new(true));
 
@@ -1880,13 +2139,33 @@ fn main() -> io::Result<()> {
     let (ai_tx, ai_rx) = mpsc::channel();
     let mut ai_mode = AiMode::Idle;
     const CMD_SYSTEM: &str = "You are a shell assistant. Reply with exactly one shell command, no explanation, no markdown code blocks.";
+    const COMPLETE_SYSTEM: &str = "You are a shell assistant. The user has typed a partial shell command. Reply with the COMPLETE command on one line: first the exact characters they already typed, then the rest (complete the word and add the full command). Your reply must start with their text. Example: if they typed 'git clo' reply 'git clone https://github.com/user/repo.git' or 'git clone <repo>'. No explanation, no markdown.";
+
+    // Ghost text autocomplete: Fish-style, per character (history instant; AI fallback debounced).
+    let mut ghost: Option<GhostSuggestion> = None;
+    let mut shadow_line = String::new(); // current line we're typing (for instant history lookup)
+    let mut last_ghost_key: Option<Instant> = None;
+    let mut ghost_pending = false;
+    const GHOST_AI_DEBOUNCE_MS: u64 = 400;
+    const GHOST_MIN_PREFIX_LEN: usize = 1;
+    const GHOST_AI_MIN_PREFIX_LEN: usize = 2; // require 2+ chars before calling API
+    let (ghost_tx, ghost_rx) = mpsc::channel::<(String, String)>();
+    let mut shell_history = load_shell_history();
+
+    // AI bar (Ctrl+K) ghost: completion in the prompt input
+    let mut ai_bar_ghost: Option<GhostSuggestion> = None;
+    let mut last_ai_bar_ghost_key: Option<Instant> = None;
+    let mut ai_bar_ghost_pending = false;
+    let (ai_bar_ghost_tx, ai_bar_ghost_rx) = mpsc::channel::<(String, String)>();
 
     while running.load(Ordering::Relaxed) {
         // Exit when shell exits (Ctrl+D or `exit`)
         if child.try_wait().ok().flatten().is_some() {
             break;
         }
-        if event::poll(Duration::from_millis(16)).unwrap_or(false) {
+        let had_input_event = event::poll(Duration::from_millis(16)).unwrap_or(false);
+        if had_input_event {
+            screen_dirty.store(true, Ordering::Relaxed);
             match event::read() {
                 Ok(Event::Key(KeyEvent {
                     code,
@@ -1928,6 +2207,8 @@ fn main() -> io::Result<()> {
                             ai_mode = AiMode::PromptInput {
                                 buffer: String::new(),
                             };
+                            ai_bar_ghost = None;
+                            last_ai_bar_ghost_key = None;
                         }
                         continue;
                     }
@@ -1950,14 +2231,27 @@ fn main() -> io::Result<()> {
                                 match code {
                                     KeyCode::Char(c) if !c.is_control() => {
                                         buffer.push(c);
+                                        last_ai_bar_ghost_key = Some(Instant::now());
+                                        ai_bar_ghost = None;
                                     }
                                     KeyCode::Backspace => {
                                         buffer.pop();
+                                        last_ai_bar_ghost_key = Some(Instant::now());
+                                        ai_bar_ghost = None;
+                                    }
+                                    KeyCode::Tab => {
+                                        if ai_bar_ghost.as_ref().is_some_and(|g| buffer.trim() == g.for_prefix) {
+                                            if let Some(g) = ai_bar_ghost.take() {
+                                                buffer.push_str(&g.suffix);
+                                            }
+                                        }
                                     }
                                     KeyCode::Enter => {
                                         let prompt = buffer.trim().to_string();
                                         if prompt.is_empty() {
                                             ai_mode = AiMode::Idle;
+                                            shadow_line.clear();
+                                            ghost = None;
                                         } else if prompt == "/model" || prompt == "/models" {
                                             let choices = available_backends(&ai_config);
                                             ai_mode = AiMode::BackendPicker {
@@ -2045,8 +2339,12 @@ fn main() -> io::Result<()> {
                                     let _ = pty_writer.write_all(&[b'\r']);
                                     let _ = pty_writer.flush();
                                     ai_mode = AiMode::Idle;
+                                    shadow_line.clear();
+                                    ghost = None;
                                 } else if code == KeyCode::Esc {
                                     ai_mode = AiMode::Idle;
+                                    shadow_line.clear();
+                                    ghost = None;
                                 }
                             }
                             AiMode::Error { .. } => {
@@ -2266,11 +2564,146 @@ fn main() -> io::Result<()> {
                         }
                         if exit_wizard_to_idle {
                             ai_mode = AiMode::Idle;
+                            shadow_line.clear();
+                            ghost = None;
                         }
                         if reload_ai_config {
                             ai_config = load_ai_config();
                         }
                         continue;
+                    }
+
+                    // Fish-style: Tab, Right, or End accepts full ghost; Ctrl+Right accepts one word.
+                    // Match using shadow_line so accept works even when PTY echo is one frame behind.
+                    let accept_full = matches!(code, KeyCode::Tab | KeyCode::Right | KeyCode::End)
+                        && !modifiers.contains(KeyModifiers::CONTROL);
+                    let accept_one_word = code == KeyCode::Right && modifiers.contains(KeyModifiers::CONTROL);
+                    let shadow_cmd = command_part_of_line(shadow_line.trim());
+                    let ghost_prefix_matches = ghost.as_ref().is_some_and(|g| {
+                        g.for_prefix == shadow_cmd
+                            || screen.lock().map(|s| command_part_of_line(s.line_prefix_at_cursor().trim()) == g.for_prefix).unwrap_or(false)
+                    });
+                    if matches!(ai_mode, AiMode::Idle) && ghost_prefix_matches {
+                        if accept_full {
+                            if let Some(g) = ghost.take() {
+                                for c in g.suffix.chars() {
+                                    let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
+                                    for b in bytes {
+                                        let _ = pty_writer.write_all(&[b]);
+                                    }
+                                }
+                                shadow_line.push_str(&g.suffix);
+                                let _ = pty_writer.flush();
+                                screen_dirty.store(true, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                        if accept_one_word {
+                            if let Some(g) = ghost.take() {
+                                let (word, rest) = split_first_word(&g.suffix);
+                                if !word.is_empty() {
+                                    for c in word.chars() {
+                                        let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
+                                        for b in bytes {
+                                            let _ = pty_writer.write_all(&[b]);
+                                        }
+                                    }
+                                    shadow_line.push_str(&word);
+                                    if rest.is_empty() {
+                                        ghost = None;
+                                    } else {
+                                        let new_prefix = format!("{}{}", g.for_prefix, word);
+                                        ghost = Some(GhostSuggestion { suffix: rest, for_prefix: new_prefix });
+                                    }
+                                    let _ = pty_writer.flush();
+                                    screen_dirty.store(true, Ordering::Relaxed);
+                                } else {
+                                    ghost = Some(g);
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Content keys: update shadow_line and refresh ghost from history (per character, no debounce)
+                    if matches!(ai_mode, AiMode::Idle) {
+                        match code {
+                            KeyCode::Char(c) if !c.is_control() => {
+                                // Abbreviation expansion on space: "gco " -> "git checkout "
+                                if c == ' ' {
+                                    let cmd_part = command_part_of_line(shadow_line.trim());
+                                    let last_word = cmd_part.split_whitespace().last().unwrap_or("");
+                                    if let Some(expansion) = expand_abbrev(last_word) {
+                                        let n_back = last_word.chars().count();
+                                        for _ in 0..n_back {
+                                            shadow_line.pop();
+                                        }
+                                        shadow_line.push_str(expansion);
+                                        last_ghost_key = Some(Instant::now());
+                                        let cmd = command_part_of_line(shadow_line.trim()).to_string();
+                                        ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
+                                            history_suggestion(&shell_history, &cmd)
+                                            .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                        } else {
+                                            None
+                                        };
+                                        screen_dirty.store(true, Ordering::Relaxed);
+                                        // Send backspaces then expansion to PTY (space is not sent)
+                                        for _ in 0..n_back {
+                                            let _ = pty_writer.write_all(&[0x7f]);
+                                        }
+                                        let _ = pty_writer.write_all(expansion.as_bytes());
+                                        let _ = pty_writer.flush();
+                                        continue;
+                                    }
+                                }
+                                shadow_line.push(c);
+                                last_ghost_key = Some(Instant::now());
+                                let cmd = command_part_of_line(shadow_line.trim()).to_string();
+                                ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
+                                    history_suggestion(&shell_history, &cmd)
+                                        .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                } else {
+                                    None
+                                };
+                                screen_dirty.store(true, Ordering::Relaxed);
+                            }
+                            KeyCode::Backspace => {
+                                shadow_line.pop();
+                                last_ghost_key = Some(Instant::now());
+                                let cmd = command_part_of_line(shadow_line.trim()).to_string();
+                                ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
+                                    history_suggestion(&shell_history, &cmd)
+                                        .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                } else {
+                                    None
+                                };
+                                screen_dirty.store(true, Ordering::Relaxed);
+                            }
+                            KeyCode::Enter => {
+                                shadow_line.clear();
+                                ghost = None;
+                                shell_history = load_shell_history();
+                            }
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                            | KeyCode::Home | KeyCode::End => {
+                                shadow_line.clear();
+                                ghost = None;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Any other key sent to PTY (Tab without accept, Ctrl+L, paste, etc.): clear shadow so we don't show stale ghost
+                    if matches!(ai_mode, AiMode::Idle) {
+                        let is_content_key = matches!(code, KeyCode::Char(c) if !c.is_control())
+                            || matches!(code, KeyCode::Backspace | KeyCode::Enter)
+                            || matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                                | KeyCode::Home | KeyCode::End);
+                        if !is_content_key {
+                            shadow_line.clear();
+                            ghost = None;
+                        }
                     }
 
                     let bytes = key_to_bytes(code, modifiers);
@@ -2360,6 +2793,7 @@ fn main() -> io::Result<()> {
                     }
                 }
                 Ok(Event::Resize(c, r)) => {
+                    screen_dirty.store(true, Ordering::Relaxed);
                     let new_term_rows = r as usize;
                     let new_term_cols = c as usize;
                     let new_rows = new_term_rows.saturating_sub(art_height).max(1);
@@ -2386,25 +2820,193 @@ fn main() -> io::Result<()> {
                     Ok(cmd) => AiMode::SuggestionReady { command: cmd },
                     Err(e) => AiMode::Error { message: e },
                 };
+                screen_dirty.store(true, Ordering::Relaxed);
             }
         }
 
-        // Redraw every frame: art at top, then terminal grid; AI modal overlays center when not Idle
-        let backend = backend_override.unwrap_or(ai_config.default_backend);
-        let current_model_display = model_override
-            .as_deref()
-            .or(ai_config.default_model.as_deref())
-            .map(|m| format!("{} · {}", backend, m));
-        let current_model = current_model_display.as_deref();
-        if let (Ok(s), Ok(t)) = (screen.lock(), theme.lock()) {
-            let _ = render(&s, selection.as_ref(), art_height, &*t, false, current_model, &mut stdout);
+        // Ghost completion: poll for AI result; only apply if prefix still matches (user may have typed more)
+        if let Ok((suffix, for_prefix)) = ghost_rx.try_recv() {
+            ghost_pending = false;
+            let current_cmd = command_part_of_line(shadow_line.trim()).to_string();
+            if current_cmd == for_prefix && !suffix.is_empty() {
+                ghost = Some(GhostSuggestion { suffix, for_prefix });
+                screen_dirty.store(true, Ordering::Relaxed);
+            }
         }
-        if !matches!(ai_mode, AiMode::Idle) {
-            let (term_rows, term_cols) = terminal::size()
-                .map(|(c, r)| (r as usize, c as usize))
-                .unwrap_or((24, 80));
-            if let Ok(t) = theme.lock() {
-                let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, current_model, &mut stdout);
+        // AI fallback when no history match: debounced so we don't call API on every key
+        if matches!(ai_mode, AiMode::Idle)
+            && !ghost_pending
+            && ghost.is_none()
+            && last_ghost_key.map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS)).unwrap_or(false)
+        {
+            let prefix = screen.lock().map(|s| s.line_prefix_at_cursor()).unwrap_or_default();
+            let prefix = prefix.trim().to_string();
+            let command_part = command_part_of_line(&prefix);
+            if command_part.len() >= GHOST_AI_MIN_PREFIX_LEN {
+                ghost_pending = true;
+                last_ghost_key = Some(Instant::now());
+                    let backend = backend_override.unwrap_or(ai_config.default_backend);
+                    let config = ai_config.clone();
+                    let model_opt = model_override.clone().or_else(|| config.default_model.clone());
+                    let ghost_tx = ghost_tx.clone();
+                    let for_prefix = prefix.clone();
+                    let command_part = command_part.to_string();
+                    thread::spawn(move || {
+                    let reply = match backend {
+                        AiBackend::Ollama => {
+                            let model = match ollama_resolve_model(
+                                &config.ollama_base_url,
+                                model_opt.as_deref(),
+                            ) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            let full_prompt = ollama_build_prompt(COMPLETE_SYSTEM, &command_part);
+                            ollama_generate(&config.ollama_base_url, &model, &full_prompt)
+                        }
+                        AiBackend::OpenAi => {
+                            let api_key = match config.openai_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "gpt-4o-mini".to_string());
+                            let base = config.openai_base_url();
+                            openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                        AiBackend::Gemini => {
+                            let api_key = match config.gemini_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "gemini-2.0-flash".to_string());
+                            gemini_generate(&api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                        AiBackend::Groq => {
+                            let api_key = match config.groq_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                            let base = config.groq_base_url();
+                            openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                    };
+                    let suffix = match reply {
+                        Ok(text) => completion_suffix_from_reply(&for_prefix, &command_part, &text),
+                        Err(_) => return,
+                    };
+                    if !suffix.is_empty() {
+                        let _ = ghost_tx.send((suffix, command_part));
+                    }
+                });
+            }
+        }
+
+        // AI bar ghost: poll result and debounced completion request
+        if let Ok((suffix, for_prefix)) = ai_bar_ghost_rx.try_recv() {
+            ai_bar_ghost = Some(GhostSuggestion { suffix, for_prefix });
+            ai_bar_ghost_pending = false;
+            screen_dirty.store(true, Ordering::Relaxed);
+        }
+        if let AiMode::PromptInput { ref buffer } = ai_mode {
+            if !ai_bar_ghost_pending
+                && last_ai_bar_ghost_key.map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS)).unwrap_or(false)
+                && buffer.trim().len() >= GHOST_MIN_PREFIX_LEN
+            {
+                ai_bar_ghost_pending = true;
+                last_ai_bar_ghost_key = Some(Instant::now());
+                let for_prefix = buffer.trim().to_string();
+                let command_part = command_part_of_line(&for_prefix).to_string();
+                let backend = backend_override.unwrap_or(ai_config.default_backend);
+                let config = ai_config.clone();
+                let model_opt = model_override.clone().or_else(|| config.default_model.clone());
+                let ai_bar_ghost_tx = ai_bar_ghost_tx.clone();
+                thread::spawn(move || {
+                    let reply = match backend {
+                        AiBackend::Ollama => {
+                            let model = match ollama_resolve_model(
+                                &config.ollama_base_url,
+                                model_opt.as_deref(),
+                            ) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            let full_prompt = ollama_build_prompt(COMPLETE_SYSTEM, &command_part);
+                            ollama_generate(&config.ollama_base_url, &model, &full_prompt)
+                        }
+                        AiBackend::OpenAi => {
+                            let api_key = match config.openai_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "gpt-4o-mini".to_string());
+                            let base = config.openai_base_url();
+                            openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                        AiBackend::Gemini => {
+                            let api_key = match config.gemini_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "gemini-2.0-flash".to_string());
+                            gemini_generate(&api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                        AiBackend::Groq => {
+                            let api_key = match config.groq_api_key() {
+                                Some(k) => k,
+                                None => return,
+                            };
+                            let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                            let base = config.groq_base_url();
+                            openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
+                        }
+                    };
+                    let suffix = match reply {
+                        Ok(text) => completion_suffix_from_reply(&for_prefix, &command_part, &text),
+                        Err(_) => return,
+                    };
+                    if !suffix.is_empty() {
+                        let _ = ai_bar_ghost_tx.send((suffix, for_prefix));
+                    }
+                });
+            }
+        } else {
+            ai_bar_ghost = None;
+        }
+
+        // Redraw only when screen or UI state changed (stops constant flicker)
+        if screen_dirty.swap(false, Ordering::Relaxed) {
+            let backend = backend_override.unwrap_or(ai_config.default_backend);
+            let current_model_display = model_override
+                .as_deref()
+                .or(ai_config.default_model.as_deref())
+                .map(|m| format!("{} · {}", backend, m));
+            let current_model = current_model_display.as_deref();
+            let input_cmd_prefix = if shadow_line.trim().is_empty() {
+                None
+            } else {
+                Some(command_part_of_line(shadow_line.trim()))
+            };
+            if let (Ok(s), Ok(t)) = (screen.lock(), theme.lock()) {
+                let _ = render(
+                    &s,
+                    selection.as_ref(),
+                    art_height,
+                    &*t,
+                    false,
+                    current_model,
+                    ghost.as_ref(),
+                    input_cmd_prefix,
+                    &mut stdout,
+                );
+            }
+            if !matches!(ai_mode, AiMode::Idle) {
+                let (term_rows, term_cols) = terminal::size()
+                    .map(|(c, r)| (r as usize, c as usize))
+                    .unwrap_or((24, 80));
+                if let Ok(t) = theme.lock() {
+                    let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, current_model, ai_bar_ghost.as_ref(), &mut stdout);
+                }
             }
         }
     }
