@@ -74,7 +74,7 @@ The script installs to `~/bin` (if in your PATH) or `/usr/local/bin`, then asks:
 - **Primary (default terminal)** — Adds a desktop entry so you can set Chameleon as default in system Settings; on Linux, can register with `update-alternatives`.
 - **Secondary** — Just installs the binary; run `chameleon` when you want it.
 
-Replace `<owner>` with your GitHub org or username. To overwrite an existing install: `curl -sSL .../install.sh | sh -s -f`.
+The script fetches releases from `Haroon966/Chameleon` by default. To use another repo: `CHAMELEON_GITHUB_REPO=owner/repo curl -sSL .../install.sh | sh`. To overwrite an existing install: `curl -sSL .../install.sh | sh -s -f`.
 
 ### Manual: prebuilt binary
 
@@ -100,7 +100,7 @@ cargo build --release
 ./target/release/chameleon
 ```
 
-Replace `<owner>` with the actual GitHub org or username.
+Releases are fetched from `Haroon966/Chameleon` by default; set `CHAMELEON_GITHUB_REPO` to use another repo.
 
 ---
 

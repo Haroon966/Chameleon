@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 # Chameleon one-command installer.
-# Usage: curl -sSL https://raw.githubusercontent.com/<owner>/chameleon/main/install.sh | sh
-# Set CHAMELEON_GITHUB_REPO=owner/chameleon if different from default.
+# Usage: curl -sSL https://raw.githubusercontent.com/Haroon966/Chameleon/main/install.sh | sh
+# Set CHAMELEON_GITHUB_REPO=Haroon966/Chameleon if different from default.
 set -e
 
-GITHUB_REPO="${CHAMELEON_GITHUB_REPO:-owner/chameleon}"
+GITHUB_REPO="${CHAMELEON_GITHUB_REPO:-Haroon966/Chameleon}"
 BINARY_NAME="chameleon"
 FORCE=""
 if [ "${1:-}" = "-f" ]; then
