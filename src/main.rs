@@ -7,6 +7,7 @@
 //!   Perform impl to update the shared screen buffer; then signals redraw.
 //! - On resize: update PTY size and clear/redraw.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -18,36 +19,22 @@ use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
-    event::{
-        self,
-        Event,
-        KeyCode,
-        KeyEvent,
-        KeyModifiers,
-        MouseButton,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
     execute, queue,
     terminal::{self, ClearType},
 };
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use vte::{Params, Perform, Parser};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use vte::{Params, Parser, Perform};
+
+mod helpers;
+use helpers::{
+    command_part_of_line, completion_suffix_from_reply, destructive_command_hint, expand_abbrev,
+    history_suggestion, merged_abbrev_map, parse_hex, split_first_word, strip_code_blocks,
+};
 
 // -----------------------------------------------------------------------------
 // Theme (user-editable via config file)
 // -----------------------------------------------------------------------------
-
-/// Parses a hex color string "#rrggbb" or "rrggbb" into (r, g, b). Returns None if invalid.
-fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
-    let s = s.trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some((r, g, b))
-}
 
 const DEFAULT_FG: (u8, u8, u8) = (0xcc, 0xcc, 0xcc);
 const DEFAULT_BG: (u8, u8, u8) = (0x1e, 0x1e, 0x1e);
@@ -76,6 +63,21 @@ struct ThemeConfigFile {
     #[serde(rename = "theme")]
     theme: Option<ThemeSection>,
     ai: Option<AiSection>,
+    #[serde(default)]
+    abbrev: Option<HashMap<String, String>>,
+    #[serde(default)]
+    general: Option<GeneralSection>,
+}
+
+#[derive(serde::Deserialize, Default, Clone)]
+struct GeneralSection {
+    /// If false, skip the ASCII banner so the PTY gets more rows.
+    #[serde(default = "default_true")]
+    show_banner: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(serde::Deserialize)]
@@ -197,9 +199,7 @@ fn load_ai_config() -> AiConfig {
             }
         }
     };
-    let ollama_base_url = section
-        .base_url
-        .unwrap_or_else(|| default_url.clone());
+    let ollama_base_url = section.base_url.unwrap_or_else(|| default_url.clone());
     let default_backend = section
         .backend
         .as_deref()
@@ -232,12 +232,9 @@ impl AiConfig {
         })
     }
     fn groq_api_key(&self) -> Option<String> {
-        std::env::var("GROQ_API_KEY").ok().or_else(|| {
-            self.providers
-                .groq
-                .as_ref()
-                .and_then(|p| p.api_key.clone())
-        })
+        std::env::var("GROQ_API_KEY")
+            .ok()
+            .or_else(|| self.providers.groq.as_ref().and_then(|p| p.api_key.clone()))
     }
     fn is_configured(&self, backend: AiBackend) -> bool {
         match backend {
@@ -312,9 +309,7 @@ fn ollama_list_models(base_url: &str) -> Result<Vec<String>, String> {
         .timeout(std::time::Duration::from_millis(OLLAMA_TIMEOUT_MS))
         .call()
         .map_err(|e| e.to_string())?;
-    let body: serde_json::Value = response
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = response.into_json().map_err(|e| e.to_string())?;
     let empty: Vec<serde_json::Value> = Vec::new();
     let models = body
         .get("models")
@@ -337,7 +332,10 @@ fn ollama_resolve_model(base_url: &str, config_model: Option<&str>) -> Result<St
         if list.iter().any(|n| n == want) {
             return Ok(want.to_string());
         }
-        return Err(format!("Configured model '{want}' not found. Available: {}", list.join(", ")));
+        return Err(format!(
+            "Configured model '{want}' not found. Available: {}",
+            list.join(", ")
+        ));
     }
     Ok(list.into_iter().next().unwrap())
 }
@@ -393,80 +391,34 @@ fn ollama_generate(base_url: &str, model: &str, prompt: &str) -> Result<String, 
 
 const OPENAI_TIMEOUT_MS: u64 = 30_000;
 
-fn strip_code_blocks(text: &str) -> String {
-    let text = text.trim().to_string();
-    let text = text
-        .strip_prefix("```")
-        .and_then(|s| s.strip_suffix("```"))
-        .map(|s| s.trim())
-        .unwrap_or(text.as_str())
-        .to_string();
-    let text = text
-        .strip_prefix("bash")
-        .or_else(|| text.strip_prefix("sh"))
-        .map(|s| s.trim())
-        .unwrap_or(text.as_str())
-        .to_string();
-    text
+/// Read `[abbrev]` and `[general]` from config (same file as theme). User abbrevs override builtins.
+fn load_runtime_opts_from_disk() -> (HashMap<String, String>, bool) {
+    let mut user_abbrevs = HashMap::new();
+    let mut show_banner = true;
+    let Some(config_path) = theme_config_path() else {
+        return (user_abbrevs, show_banner);
+    };
+    let Ok(contents) = std::fs::read_to_string(&config_path) else {
+        return (user_abbrevs, show_banner);
+    };
+    let Ok(file_config) = toml::from_str::<ThemeConfigFile>(&contents) else {
+        return (user_abbrevs, show_banner);
+    };
+    if let Some(a) = file_config.abbrev {
+        user_abbrevs = a;
+    }
+    if let Some(g) = file_config.general {
+        show_banner = g.show_banner;
+    }
+    (user_abbrevs, show_banner)
 }
 
-// -----------------------------------------------------------------------------
-// Abbreviations: expand on space (e.g. "gco " -> "git checkout ")
-// -----------------------------------------------------------------------------
-
-const ABBREVS: &[(&str, &str)] = &[
-    ("gco", "git checkout "),
-    ("gst", "git status "),
-    ("gci", "git commit "),
-    ("gbr", "git branch "),
-    ("glog", "git log "),
-    ("gdiff", "git diff "),
-    ("gadd", "git add "),
-    ("gpush", "git push "),
-    ("gpull", "git pull "),
-    ("gmerge", "git merge "),
-    ("gfetch", "git fetch "),
-    ("gshow", "git show "),
-    ("grebase", "git rebase "),
-    ("greset", "git reset "),
-    ("ll", "ls -la "),
-    ("la", "ls -la "),
-];
-
-fn expand_abbrev(word: &str) -> Option<&'static str> {
-    let word = word.trim();
-    ABBREVS
-        .iter()
-        .find(|(abbr, _)| *abbr == word)
-        .map(|(_, expansion)| *expansion)
-}
-
-/// From a terminal line (possibly with shell prompt), return the part that is the command to complete.
-/// E.g. "user@host:~$ git clo" -> "git clo"; "git clo" -> "git clo".
-fn command_part_of_line(line: &str) -> &str {
-    let line = line.trim();
-    for sep in [" $ ", " # ", "> ", "] "] {
-        if let Some(i) = line.rfind(sep) {
-            return line[i + sep.len()..].trim_start();
-        }
-    }
-    line.trim_start()
-}
-
-/// Given the full line prefix and the AI reply (full completed command), return the suffix to append.
-fn completion_suffix_from_reply(full_prefix: &str, command_part: &str, reply: &str) -> String {
-    let text = strip_code_blocks(&reply.trim().to_string());
-    if text.is_empty() {
-        return String::new();
-    }
-    // Reply should be the full command; strip the part user already typed to get suffix.
-    if text.starts_with(command_part) {
-        text[command_part.len()..].trim_start().to_string()
-    } else if text.starts_with(full_prefix.trim()) {
-        text[full_prefix.trim().len()..].trim_start().to_string()
-    } else {
-        text
-    }
+/// Bracketed paste (CSI ?2004h should be enabled on the PTY consumer when supported).
+fn paste_bracketed<W: Write>(pty: &mut W, text: &str) -> io::Result<()> {
+    pty.write_all(b"\x1b[200~")?;
+    pty.write_all(text.as_bytes())?;
+    pty.write_all(b"\x1b[201~")?;
+    pty.flush()
 }
 
 // -----------------------------------------------------------------------------
@@ -505,9 +457,14 @@ fn load_shell_history() -> Vec<String> {
                     continue;
                 }
                 let cmd = if is_fish {
-                    line.strip_prefix("- cmd:").map(|s| s.trim().trim_matches('"')).unwrap_or("").trim()
+                    line.strip_prefix("- cmd:")
+                        .map(|s| s.trim().trim_matches('"'))
+                        .unwrap_or("")
+                        .trim()
                 } else if is_zsh {
-                    line.rfind(';').map(|i| line[i + 1..].trim()).unwrap_or(line)
+                    line.rfind(';')
+                        .map(|i| line[i + 1..].trim())
+                        .unwrap_or(line)
                 } else {
                     line
                 };
@@ -524,34 +481,6 @@ fn load_shell_history() -> Vec<String> {
 #[cfg(windows)]
 fn load_shell_history() -> Vec<String> {
     Vec::new()
-}
-
-/// Split suffix into first word (including one trailing space if present) and the rest.
-fn split_first_word(suffix: &str) -> (String, String) {
-    let s = suffix.trim_start();
-    let word: String = s.chars().take_while(|c| !c.is_whitespace()).collect();
-    let after_word: String = s.chars().skip(word.len()).collect();
-    let rest = after_word.trim_start().to_string();
-    let to_inject = if after_word != rest {
-        format!("{} ", word)
-    } else {
-        word
-    };
-    (to_inject, rest)
-}
-
-/// Find the newest history entry that starts with `prefix` and is longer than prefix. Returns the suffix to append.
-fn history_suggestion(history: &[String], command_part: &str) -> Option<String> {
-    if command_part.is_empty() {
-        return None;
-    }
-    for cmd in history {
-        let cmd = cmd.trim();
-        if cmd.starts_with(command_part) && cmd.len() > command_part.len() {
-            return Some(cmd[command_part.len()..].to_string());
-        }
-    }
-    None
 }
 
 /// OpenAI (and compatible) chat completions; returns single message content.
@@ -737,8 +666,7 @@ fn load_theme() -> Theme {
 
 /// Returns the config file path for the theme (for opening in editor). May be None.
 fn theme_config_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("", "", "chameleon")
-        .map(|d| d.config_dir().join("config.toml"))
+    directories::ProjectDirs::from("", "", "chameleon").map(|d| d.config_dir().join("config.toml"))
 }
 
 /// Write a provider's API key into config.toml (merge with existing). Key is stored under [ai.providers.<provider>].
@@ -753,7 +681,8 @@ fn write_provider_api_key(provider: &str, api_key: &str) -> Result<(), String> {
     } else {
         contents
     };
-    let mut root: toml::Value = toml::from_str(&contents).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let mut root: toml::Value =
+        toml::from_str(&contents).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
     let root_table = root.as_table_mut().ok_or("config root is not a table")?;
     let ai_table = root_table
         .entry("ai".to_string())
@@ -762,12 +691,19 @@ fn write_provider_api_key(provider: &str, api_key: &str) -> Result<(), String> {
     let providers_table = ai
         .entry("providers".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let providers = providers_table.as_table_mut().ok_or("ai.providers is not a table")?;
+    let providers = providers_table
+        .as_table_mut()
+        .ok_or("ai.providers is not a table")?;
     let provider_table = providers
         .entry(provider.to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let prov = provider_table.as_table_mut().ok_or("provider entry is not a table")?;
-    prov.insert("api_key".to_string(), toml::Value::String(api_key.to_string()));
+    let prov = provider_table
+        .as_table_mut()
+        .ok_or("provider entry is not a table")?;
+    prov.insert(
+        "api_key".to_string(),
+        toml::Value::String(api_key.to_string()),
+    );
     let new_contents = toml::ser::to_string_pretty(&root).map_err(|e| e.to_string())?;
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -798,7 +734,9 @@ fn remove_provider_api_key(provider: &str) -> Result<(), String> {
     let Some(providers_table) = ai.get_mut("providers") else {
         return Ok(());
     };
-    let providers = providers_table.as_table_mut().ok_or("ai.providers is not a table")?;
+    let providers = providers_table
+        .as_table_mut()
+        .ok_or("ai.providers is not a table")?;
     providers.remove(provider);
     let new_contents = toml::ser::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(&config_path, new_contents).map_err(|e| e.to_string())?;
@@ -811,7 +749,15 @@ const DEFAULT_CONFIG: &str = r##"# Chameleon theme — edit and save; press Ctrl
 default_foreground = "#cccccc"
 default_background = "#1e1e1e"
 background_opacity = 0.95
+# font_size is stored for future use; the host terminal font is not changed by Chameleon.
 font_size = 14
+
+[general]
+show_banner = true
+
+# Optional custom abbreviations (override builtins with the same key):
+# [abbrev]
+# mydeploy = "kubectl apply -f deploy.yaml "
 "##;
 
 /// Open the theme config file in $EDITOR, then reload theme into `theme`. Restores terminal state
@@ -819,6 +765,8 @@ font_size = 14
 fn open_theme_config_and_reload(
     stdout: &mut io::Stdout,
     theme: &Arc<Mutex<Theme>>,
+    abbrev_merged: &Arc<Mutex<HashMap<String, String>>>,
+    show_banner: &Arc<Mutex<bool>>,
 ) -> io::Result<()> {
     let config_path = match theme_config_path() {
         Some(p) => p,
@@ -859,6 +807,13 @@ fn open_theme_config_and_reload(
     if let Ok(mut t) = theme.lock() {
         *t = new_theme;
     }
+    let (user_ab, banner) = load_runtime_opts_from_disk();
+    if let Ok(mut m) = abbrev_merged.lock() {
+        *m = merged_abbrev_map(&user_ab);
+    }
+    if let Ok(mut b) = show_banner.lock() {
+        *b = banner;
+    }
     execute!(stdout, terminal::Clear(ClearType::All))?;
     if let Ok(t) = theme.lock() {
         let (r, g, b) = t.default_background;
@@ -876,13 +831,16 @@ fn open_theme_config_and_reload(
 // Screen buffer (shared between vte Perform and main thread)
 // -----------------------------------------------------------------------------
 
-/// Single cell: character and basic attributes (minimal — no truecolor).
+/// Single cell: one terminal column (CJK uses two cells; second has `wide_continuation`).
 #[derive(Clone, Copy, Debug)]
 struct Cell {
     ch: char,
-    fg: u8, // 0–7 standard colors (we map to crossterm)
+    fg: u8,
     bg: u8,
+    fg_rgb: Option<(u8, u8, u8)>,
+    bg_rgb: Option<(u8, u8, u8)>,
     bold: bool,
+    wide_continuation: bool,
 }
 
 impl Default for Cell {
@@ -891,7 +849,10 @@ impl Default for Cell {
             ch: ' ',
             fg: 7,
             bg: 0,
+            fg_rgb: None,
+            bg_rgb: None,
             bold: false,
+            wide_continuation: false,
         }
     }
 }
@@ -907,7 +868,11 @@ struct Screen {
     /// Current attributes for new characters
     cur_fg: u8,
     cur_bg: u8,
+    cur_fg_rgb: Option<(u8, u8, u8)>,
+    cur_bg_rgb: Option<(u8, u8, u8)>,
     cur_bold: bool,
+    /// Lines scrolled off the top (oldest at front), capped.
+    scrollback: VecDeque<Vec<Cell>>,
 }
 
 impl Screen {
@@ -924,7 +889,10 @@ impl Screen {
             cursor_col: 0,
             cur_fg: 7,
             cur_bg: 0,
+            cur_fg_rgb: None,
+            cur_bg_rgb: None,
             cur_bold: false,
+            scrollback: VecDeque::new(),
         }
     }
 
@@ -954,16 +922,61 @@ impl Screen {
     }
 
     fn put_char(&mut self, c: char) {
-        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
+        if self.cursor_row >= self.rows {
             return;
         }
-        self.grid[self.cursor_row][self.cursor_col] = Cell {
-            ch: c,
-            fg: self.cur_fg,
-            bg: self.cur_bg,
-            bold: self.cur_bold,
-        };
-        self.cursor_col += 1;
+        if unicode_width::UnicodeWidthChar::width(c) == Some(0) {
+            return;
+        }
+        let w = unicode_width::UnicodeWidthChar::width(c)
+            .unwrap_or(1)
+            .max(1);
+        if w == 1 {
+            if self.cursor_col >= self.cols {
+                self.cursor_col = 0;
+                self.cursor_row += 1;
+                if self.cursor_row >= self.rows {
+                    self.scroll_up();
+                    self.cursor_row = self.rows.saturating_sub(1);
+                }
+            }
+            if self.cursor_row >= self.rows {
+                return;
+            }
+            self.grid[self.cursor_row][self.cursor_col] = Cell {
+                ch: c,
+                fg: self.cur_fg,
+                bg: self.cur_bg,
+                fg_rgb: self.cur_fg_rgb,
+                bg_rgb: self.cur_bg_rgb,
+                bold: self.cur_bold,
+                wide_continuation: false,
+            };
+            self.cursor_col += 1;
+        } else if self.cursor_col + 1 < self.cols {
+            self.grid[self.cursor_row][self.cursor_col] = Cell {
+                ch: c,
+                fg: self.cur_fg,
+                bg: self.cur_bg,
+                fg_rgb: self.cur_fg_rgb,
+                bg_rgb: self.cur_bg_rgb,
+                bold: self.cur_bold,
+                wide_continuation: false,
+            };
+            self.grid[self.cursor_row][self.cursor_col + 1] = Cell {
+                ch: ' ',
+                fg: self.cur_fg,
+                bg: self.cur_bg,
+                fg_rgb: self.cur_fg_rgb,
+                bg_rgb: self.cur_bg_rgb,
+                bold: self.cur_bold,
+                wide_continuation: true,
+            };
+            self.cursor_col += 2;
+        } else {
+            self.put_char('>');
+            return;
+        }
         if self.cursor_col >= self.cols {
             self.cursor_col = 0;
             self.cursor_row += 1;
@@ -978,7 +991,12 @@ impl Screen {
         if self.rows == 0 {
             return;
         }
-        self.grid.remove(0);
+        const MAX_SCROLLBACK: usize = 10_000;
+        let line = self.grid.remove(0);
+        while self.scrollback.len() >= MAX_SCROLLBACK {
+            self.scrollback.pop_front();
+        }
+        self.scrollback.push_back(line);
         self.grid.push(vec![Cell::default(); self.cols]);
     }
 
@@ -993,7 +1011,11 @@ impl Screen {
     fn erase_from_cursor_to_end_of_screen(&mut self) {
         for r in self.cursor_row..self.rows {
             for c in 0..self.cols {
-                let col_start = if r == self.cursor_row { self.cursor_col } else { 0 };
+                let col_start = if r == self.cursor_row {
+                    self.cursor_col
+                } else {
+                    0
+                };
                 if c >= col_start {
                     self.put_cell(r, c, Cell::default());
                 }
@@ -1053,7 +1075,15 @@ impl Screen {
         }
         let row = &self.grid[self.cursor_row];
         let end = self.cursor_col.min(row.len());
-        row[..end].iter().map(|c| c.ch).collect()
+        let mut s = String::new();
+        for c in 0..end {
+            let cell = row[c];
+            if cell.wide_continuation {
+                continue;
+            }
+            s.push(cell.ch);
+        }
+        s
     }
 
     /// Last N rows of the grid as plain text (trimmed, newline-joined). Reserved for future use.
@@ -1064,13 +1094,29 @@ impl Screen {
         for r in start..self.rows {
             if r < self.grid.len() {
                 let row = &self.grid[r];
-                let line: String = row.iter().map(|c| c.ch).collect::<String>().trim_end().to_string();
+                let line: String = row
+                    .iter()
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string();
                 lines.push(line);
             }
         }
         lines.join("\n")
     }
 
+    /// One logical line of the document: scrollback (oldest first) then live `grid` rows.
+    fn doc_row_slice<'a>(&'a self, doc_line: usize, empty: &'a [Cell]) -> &'a [Cell] {
+        let s = self.scrollback.len();
+        if doc_line < s {
+            self.scrollback[doc_line].as_slice()
+        } else if doc_line - s < self.rows {
+            self.grid[doc_line - s].as_slice()
+        } else {
+            empty
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1113,8 +1159,15 @@ impl Perform for TerminalPerform {
             match byte {
                 0x07 => {} // BEL - ignore or beep
                 0x08 => {
-                    // BS
-                    s.cursor_col = s.cursor_col.saturating_sub(1);
+                    // BS (step back past wide char tail)
+                    if s.cursor_col > 0 {
+                        s.cursor_col -= 1;
+                        if s.cursor_row < s.rows && s.cursor_col < s.cols {
+                            if s.grid[s.cursor_row][s.cursor_col].wide_continuation {
+                                s.cursor_col = s.cursor_col.saturating_sub(1);
+                            }
+                        }
+                    }
                 }
                 0x09 => {
                     // TAB - advance to next multiple of 8
@@ -1171,11 +1224,13 @@ impl Perform for TerminalPerform {
                 }
                 'B' => {
                     // CUD - cursor down
-                    s.cursor_row = (s.cursor_row + default(0) as usize).min(s.rows.saturating_sub(1));
+                    s.cursor_row =
+                        (s.cursor_row + default(0) as usize).min(s.rows.saturating_sub(1));
                 }
                 'C' => {
                     // CUF - cursor forward
-                    s.cursor_col = (s.cursor_col + default(0) as usize).min(s.cols.saturating_sub(1));
+                    s.cursor_col =
+                        (s.cursor_col + default(0) as usize).min(s.cols.saturating_sub(1));
                 }
                 'D' => {
                     // CUB - cursor back
@@ -1218,30 +1273,59 @@ impl Perform for TerminalPerform {
                             0 => {
                                 s.cur_fg = 7;
                                 s.cur_bg = 0;
+                                s.cur_fg_rgb = None;
+                                s.cur_bg_rgb = None;
                                 s.cur_bold = false;
                             }
                             1 => s.cur_bold = true,
-                            7 => {} // reverse (skip for minimal)
+                            7 => {}  // reverse (skip for minimal)
                             27 => {} // not reverse
-                            30..=37 => s.cur_fg = (code - 30) as u8,
+                            30..=37 => {
+                                s.cur_fg = (code - 30) as u8;
+                                s.cur_fg_rgb = None;
+                            }
                             38 => {
-                                // set fg (skip 256/24bit for minimal)
-                                if i + 1 < p.len() && p[i + 1] == 5 && i + 2 < p.len() {
+                                if i + 1 < p.len() && p[i + 1] == 2 && i + 4 < p.len() {
+                                    let r = p[i + 2] as u8;
+                                    let g = p[i + 3] as u8;
+                                    let b = p[i + 4] as u8;
+                                    s.cur_fg_rgb = Some((r, g, b));
+                                    s.cur_fg = 7;
+                                    i += 4;
+                                } else if i + 1 < p.len() && p[i + 1] == 5 && i + 2 < p.len() {
                                     s.cur_fg = p[i + 2] as u8 % 8;
+                                    s.cur_fg_rgb = None;
                                     i += 2;
                                 }
                                 i += 1;
                             }
-                            39 => s.cur_fg = 7,
-                            40..=47 => s.cur_bg = (code - 40) as u8,
+                            39 => {
+                                s.cur_fg = 7;
+                                s.cur_fg_rgb = None;
+                            }
+                            40..=47 => {
+                                s.cur_bg = (code - 40) as u8;
+                                s.cur_bg_rgb = None;
+                            }
                             48 => {
-                                if i + 1 < p.len() && p[i + 1] == 5 && i + 2 < p.len() {
+                                if i + 1 < p.len() && p[i + 1] == 2 && i + 4 < p.len() {
+                                    let r = p[i + 2] as u8;
+                                    let g = p[i + 3] as u8;
+                                    let b = p[i + 4] as u8;
+                                    s.cur_bg_rgb = Some((r, g, b));
+                                    s.cur_bg = 0;
+                                    i += 4;
+                                } else if i + 1 < p.len() && p[i + 1] == 5 && i + 2 < p.len() {
                                     s.cur_bg = p[i + 2] as u8 % 8;
+                                    s.cur_bg_rgb = None;
                                     i += 2;
                                 }
                                 i += 1;
                             }
-                            49 => s.cur_bg = 0,
+                            49 => {
+                                s.cur_bg = 0;
+                                s.cur_bg_rgb = None;
+                            }
                             _ => {}
                         }
                         i += 1;
@@ -1301,8 +1385,7 @@ impl Perform for TerminalPerform {
 }
 
 // Fix Screen methods that take &mut self and extra arg (ED 1)
-impl Screen {
-}
+impl Screen {}
 
 // -----------------------------------------------------------------------------
 // Selection (for copy)
@@ -1331,8 +1414,10 @@ impl Selection {
     /// Normalize to (first_row, first_col, last_row, last_col) in stream order.
     fn normalized(&self) -> (usize, usize, usize, usize) {
         let (r1, c1, r2, c2) = if Self::stream_order_before(
-            self.start_row, self.start_col,
-            self.end_row, self.end_col,
+            self.start_row,
+            self.start_col,
+            self.end_row,
+            self.end_col,
         ) {
             (self.start_row, self.start_col, self.end_row, self.end_col)
         } else {
@@ -1355,11 +1440,19 @@ impl Selection {
         let mut lines = Vec::new();
         for r in r1..=r2 {
             let start_c = if r == r1 { c1 } else { 0 };
-            let end_c = if r == r2 { c2 } else { screen.cols.saturating_sub(1) };
+            let end_c = if r == r2 {
+                c2
+            } else {
+                screen.cols.saturating_sub(1)
+            };
             let mut line = String::new();
             if r < screen.grid.len() {
                 for c in start_c..=end_c.min(screen.grid[r].len().saturating_sub(1)) {
-                    line.push(screen.grid[r][c].ch);
+                    let cell = screen.grid[r][c];
+                    if cell.wide_continuation {
+                        continue;
+                    }
+                    line.push(cell.ch);
                 }
             }
             lines.push(line.trim_end().to_string());
@@ -1413,21 +1506,33 @@ fn selection_line_at(screen: &Screen, row: usize) -> (usize, usize, usize, usize
 /// Step in the Configure API wizard.
 #[derive(Clone, Debug)]
 enum ConfigApiStep {
-    ChooseProvider { selected: usize },
+    ChooseProvider {
+        selected: usize,
+    },
     EnterKey {
         provider: AiBackend,
         key_buffer: String,
     },
-    Done { message: String },
+    Done {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug)]
 enum AiMode {
     Idle,
-    PromptInput { buffer: String },
+    PromptInput {
+        buffer: String,
+    },
     Thinking,
-    SuggestionReady { command: String },
-    Error { message: String },
+    SuggestionReady {
+        command: String,
+        risk_hint: Option<String>,
+        destructive_confirmed: bool,
+    },
+    Error {
+        message: String,
+    },
     BackendPicker {
         choices: Vec<BackendChoice>,
         selected: usize,
@@ -1437,11 +1542,23 @@ enum AiMode {
         models: Vec<String>,
         selected: usize,
     },
-    ConfigApiWizard { step: ConfigApiStep },
+    ConfigApiWizard {
+        step: ConfigApiStep,
+    },
     RemoveApiPicker {
         backends: Vec<AiBackend>,
         selected: usize,
     },
+}
+
+fn ai_suggestion_ready(cmd: String) -> AiMode {
+    let risk_hint = destructive_command_hint(&cmd).map(str::to_string);
+    let destructive_confirmed = risk_hint.is_none();
+    AiMode::SuggestionReady {
+        command: cmd,
+        risk_hint,
+        destructive_confirmed,
+    }
 }
 
 /// Ghost text suggestion: suffix to show after cursor, and prefix it was generated for (for invalidation).
@@ -1485,14 +1602,28 @@ fn render_ai_bar(
         g: theme.default_background.1,
         b: theme.default_background.2,
     };
-    let dim = crossterm::style::Color::Rgb { r: 0x66, g: 0x66, b: 0x66 };
+    let dim = crossterm::style::Color::Rgb {
+        r: 0x66,
+        g: 0x66,
+        b: 0x66,
+    };
 
     let top_left = start_col as u16;
     let top_row = start_row as u16;
 
     // ─── Top border (rounded) ───
-    queue!(stdout, cursor::MoveTo(top_left, top_row), crossterm::style::SetForegroundColor(dim), crossterm::style::SetBackgroundColor(bg))?;
-    queue!(stdout, crossterm::style::Print('╭'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('╮'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, top_row),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::SetBackgroundColor(bg)
+    )?;
+    queue!(
+        stdout,
+        crossterm::style::Print('╭'),
+        crossterm::style::Print("─".repeat(inner_w)),
+        crossterm::style::Print('╮')
+    )?;
 
     // Row 1: title + optional model name + close
     let r1 = top_row + 1;
@@ -1503,8 +1634,17 @@ fn render_ai_bar(
         AiMode::RemoveApiPicker { .. } => "  Remove API",
         _ => "  Command instructions",
     };
-    queue!(stdout, cursor::MoveTo(top_left, r1), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-    queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(title))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, r1),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('│')
+    )?;
+    queue!(
+        stdout,
+        crossterm::style::SetForegroundColor(fg),
+        crossterm::style::Print(title)
+    )?;
     let mut used = title.len();
     if let Some(model) = current_model {
         let model_label = format!(" · {}", model);
@@ -1514,16 +1654,36 @@ fn render_ai_bar(
         } else {
             model_label
         };
-        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&show))?;
+        queue!(
+            stdout,
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print(&show)
+        )?;
         used += show.len();
     }
     let gap = inner_w.saturating_sub(used).saturating_sub(6);
-    queue!(stdout, crossterm::style::SetForegroundColor(bg), crossterm::style::Print(" ".repeat(gap)))?;
-    queue!(stdout, cursor::MoveTo(top_left + w_u - 6, r1), crossterm::style::SetForegroundColor(dim), crossterm::style::Print(" Esc │"))?;
+    queue!(
+        stdout,
+        crossterm::style::SetForegroundColor(bg),
+        crossterm::style::Print(" ".repeat(gap))
+    )?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + w_u - 6, r1),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print(" Esc │")
+    )?;
 
     // Row 2: separator
     let r2 = top_row + 2;
-    queue!(stdout, cursor::MoveTo(top_left, r2), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('├'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('┤'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, r2),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('├'),
+        crossterm::style::Print("─".repeat(inner_w)),
+        crossterm::style::Print('┤')
+    )?;
 
     // Row 3: main content (input or message)
     let r3 = top_row + 3;
@@ -1531,7 +1691,10 @@ fn render_ai_bar(
         AiMode::PromptInput { buffer } => {
             let max_len = inner_w.saturating_sub(6);
             let display = if buffer.len() > max_len {
-                format!("{}…", &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..])
+                format!(
+                    "{}…",
+                    &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..]
+                )
             } else {
                 buffer.clone()
             };
@@ -1548,14 +1711,27 @@ fn render_ai_bar(
             (format!("  › {}_", display), line2, buffer.is_empty())
         }
         AiMode::Thinking => ("  Thinking…".to_string(), String::new(), false),
-        AiMode::SuggestionReady { command } => {
+        AiMode::SuggestionReady {
+            command,
+            risk_hint,
+            destructive_confirmed,
+        } => {
             let max_len = inner_w.saturating_sub(4);
             let display = if command.len() > max_len {
                 format!("{}…", &command[..max_len.saturating_sub(1)])
             } else {
                 command.clone()
             };
-            (format!("  {}", display), "  Enter run · Esc dismiss".to_string(), false)
+            let line2 = if let Some(ref h) = risk_hint {
+                if !destructive_confirmed {
+                    format!("  Warning: {} — Enter again to confirm · Esc", h)
+                } else {
+                    "  Enter run · Esc dismiss".to_string()
+                }
+            } else {
+                "  Enter run · Esc dismiss".to_string()
+            };
+            (format!("  {}", display), line2, false)
         }
         AiMode::Error { message } => {
             let max_len = inner_w.saturating_sub(10);
@@ -1564,14 +1740,37 @@ fn render_ai_bar(
             } else {
                 message.clone()
             };
-            (format!("  {}", display), "  Esc to close".to_string(), false)
+            (
+                format!("  {}", display),
+                "  Esc to close".to_string(),
+                false,
+            )
         }
-        AiMode::BackendPicker { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
-        AiMode::ModelPicker { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
-        AiMode::RemoveApiPicker { .. } => (String::new(), "  Enter remove · Esc cancel".to_string(), false),
+        AiMode::BackendPicker { .. } => (
+            String::new(),
+            "  Enter select · Esc cancel".to_string(),
+            false,
+        ),
+        AiMode::ModelPicker { .. } => (
+            String::new(),
+            "  Enter select · Esc cancel".to_string(),
+            false,
+        ),
+        AiMode::RemoveApiPicker { .. } => (
+            String::new(),
+            "  Enter remove · Esc cancel".to_string(),
+            false,
+        ),
         AiMode::ConfigApiWizard { step } => match step {
-            ConfigApiStep::ChooseProvider { .. } => (String::new(), "  Enter select · Esc cancel".to_string(), false),
-            ConfigApiStep::EnterKey { provider, key_buffer } => {
+            ConfigApiStep::ChooseProvider { .. } => (
+                String::new(),
+                "  Enter select · Esc cancel".to_string(),
+                false,
+            ),
+            ConfigApiStep::EnterKey {
+                provider,
+                key_buffer,
+            } => {
                 let prompt = format!("  API key for {}: {}_", provider, key_buffer);
                 (prompt, "  Enter save · Esc cancel".to_string(), false)
             }
@@ -1598,7 +1797,9 @@ fn render_ai_bar(
             })
             .collect();
         let visible_len = content_rows.saturating_sub(1).min(labels.len());
-        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let start = selected
+            .saturating_sub(visible_len.saturating_sub(1))
+            .min(labels.len().saturating_sub(visible_len).max(0));
         let end = (start + visible_len).min(labels.len());
         for (i, name) in labels[start..end].iter().enumerate() {
             let row = top_row + 3 + i as u16;
@@ -1609,31 +1810,80 @@ fn render_ai_bar(
             } else {
                 name.clone()
             };
-            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             if idx == *selected {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("  › ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             } else {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("    ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             }
-            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len())))
+            )?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
         }
         let footer_row = top_row + 3 + visible_len as u16;
-        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::Print(&format!(
+                "{:<width$}",
+                "  Enter select · Esc cancel",
+                width = inner_w
+            ))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
             let r = top_row + 3 + i as u16;
-            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, r),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, r),
+                crossterm::style::Print('│')
+            )?;
         }
     } else if let AiMode::RemoveApiPicker { backends, selected } = ai_mode {
         let labels: Vec<String> = backends.iter().map(|b| b.to_string()).collect();
         let visible_len = content_rows.saturating_sub(1).min(labels.len());
-        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let start = selected
+            .saturating_sub(visible_len.saturating_sub(1))
+            .min(labels.len().saturating_sub(visible_len).max(0));
         let end = (start + visible_len).min(labels.len());
         for (i, name) in labels[start..end].iter().enumerate() {
             let row = top_row + 3 + i as u16;
@@ -1644,32 +1894,84 @@ fn render_ai_bar(
             } else {
                 name.clone()
             };
-            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             if idx == *selected {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("  › ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             } else {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("    ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             }
-            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len())))
+            )?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
         }
         let footer_row = top_row + 3 + visible_len as u16;
-        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter remove · Esc cancel", width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::Print(&format!(
+                "{:<width$}",
+                "  Enter remove · Esc cancel",
+                width = inner_w
+            ))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
             let r = top_row + 3 + i as u16;
-            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, r),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, r),
+                crossterm::style::Print('│')
+            )?;
         }
-    } else if let AiMode::ConfigApiWizard { step: ConfigApiStep::ChooseProvider { selected } } = ai_mode {
+    } else if let AiMode::ConfigApiWizard {
+        step: ConfigApiStep::ChooseProvider { selected },
+    } = ai_mode
+    {
         const WIZARD_PROVIDERS: [&str; 3] = ["OpenAI", "Gemini", "Groq"];
         let labels: Vec<String> = WIZARD_PROVIDERS.iter().map(|s| (*s).to_string()).collect();
         let visible_len = content_rows.saturating_sub(1).min(labels.len());
-        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(labels.len().saturating_sub(visible_len).max(0));
+        let start = selected
+            .saturating_sub(visible_len.saturating_sub(1))
+            .min(labels.len().saturating_sub(visible_len).max(0));
         let end = (start + visible_len).min(labels.len());
         for (i, name) in labels[start..end].iter().enumerate() {
             let row = top_row + 3 + i as u16;
@@ -1680,44 +1982,136 @@ fn render_ai_bar(
             } else {
                 name.clone()
             };
-            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             if idx == *selected {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("  › ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             } else {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("    ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             }
-            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len())))
+            )?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
         }
         let footer_row = top_row + 3 + visible_len as u16;
-        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::Print(&format!(
+                "{:<width$}",
+                "  Enter select · Esc cancel",
+                width = inner_w
+            ))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
             let r = top_row + 3 + i as u16;
-            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, r),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, r),
+                crossterm::style::Print('│')
+            )?;
         }
-    } else if let AiMode::ConfigApiWizard { step: ConfigApiStep::EnterKey { .. } | ConfigApiStep::Done { .. } } = ai_mode {
-        queue!(stdout, cursor::MoveTo(top_left, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+    } else if let AiMode::ConfigApiWizard {
+        step: ConfigApiStep::EnterKey { .. } | ConfigApiStep::Done { .. },
+    } = ai_mode
+    {
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, r3),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::SetForegroundColor(fg),
+            crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, r3),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         let r4 = top_row + 4;
-        queue!(stdout, cursor::MoveTo(top_left, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, r4),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, r4),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         for i in 5..h.saturating_sub(1) {
             let r = top_row + i as u16;
-            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, r),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, r),
+                crossterm::style::Print('│')
+            )?;
         }
-    } else if let AiMode::ModelPicker { models, selected, .. } = ai_mode {
+    } else if let AiMode::ModelPicker {
+        models, selected, ..
+    } = ai_mode
+    {
         let visible_len = content_rows.saturating_sub(1).min(models.len());
-        let start = selected.saturating_sub(visible_len.saturating_sub(1)).min(models.len().saturating_sub(visible_len));
+        let start = selected
+            .saturating_sub(visible_len.saturating_sub(1))
+            .min(models.len().saturating_sub(visible_len));
         let end = (start + visible_len).min(models.len());
         for (i, name) in models[start..end].iter().enumerate() {
             let row = top_row + 3 + i as u16;
@@ -1728,78 +2122,207 @@ fn render_ai_bar(
             } else {
                 name.clone()
             };
-            queue!(stdout, cursor::MoveTo(top_left, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             if idx == *selected {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("  › "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("  › ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             } else {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print("    "))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print("    ")
+                )?;
                 queue!(stdout, crossterm::style::Print(&truncated))?;
             }
-            queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len()))))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                crossterm::style::Print(" ".repeat(inner_w.saturating_sub(4 + truncated.len())))
+            )?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, row),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
         }
         let footer_row = top_row + 3 + visible_len as u16;
-        queue!(stdout, cursor::MoveTo(top_left, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-        queue!(stdout, crossterm::style::Print(&format!("{:<width$}", "  Enter select · Esc cancel", width = inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, footer_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
+        queue!(
+            stdout,
+            crossterm::style::Print(&format!(
+                "{:<width$}",
+                "  Enter select · Esc cancel",
+                width = inner_w
+            ))
+        )?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, footer_row),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         for i in (visible_len + 1)..(h.saturating_sub(1).saturating_sub(3)) {
             let r = top_row + 3 + i as u16;
-            queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left, r),
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print('│')
+            )?;
             queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-            queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+            queue!(
+                stdout,
+                cursor::MoveTo(top_left + w_u - 1, r),
+                crossterm::style::Print('│')
+            )?;
         }
     } else {
-        queue!(stdout, cursor::MoveTo(top_left, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, r3),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         if show_placeholder {
-        queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print("  › "))?;
-        queue!(stdout, crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb { r: 0x55, g: 0x55, b: 0x55 }), crossterm::style::Print("Describe what you want to run…"))?;
-        queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print('_'))?;
-        let used = 4 + 31 + 1;
-        queue!(stdout, crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used))))?;
-    } else if let (AiMode::PromptInput { buffer }, Some(g)) = (ai_mode, ai_bar_ghost) {
+            queue!(
+                stdout,
+                crossterm::style::SetForegroundColor(dim),
+                crossterm::style::Print("  › ")
+            )?;
+            queue!(
+                stdout,
+                crossterm::style::SetForegroundColor(crossterm::style::Color::Rgb {
+                    r: 0x55,
+                    g: 0x55,
+                    b: 0x55
+                }),
+                crossterm::style::Print("Describe what you want to run…")
+            )?;
+            queue!(
+                stdout,
+                crossterm::style::SetForegroundColor(fg),
+                crossterm::style::Print('_')
+            )?;
+            let used = 4 + 31 + 1;
+            queue!(
+                stdout,
+                crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used)))
+            )?;
+        } else if let (AiMode::PromptInput { buffer }, Some(g)) = (ai_mode, ai_bar_ghost) {
             if buffer.trim() == g.for_prefix {
                 let max_len = inner_w.saturating_sub(6);
                 let display = if buffer.len() > max_len {
-                    format!("{}…", &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..])
+                    format!(
+                        "{}…",
+                        &buffer[buffer.len().saturating_sub(max_len.saturating_sub(1))..]
+                    )
                 } else {
                     buffer.clone()
                 };
                 let prefix_str = format!("  › {}_", display);
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&prefix_str))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print(&prefix_str)
+                )?;
                 let ghost_len = inner_w.saturating_sub(prefix_str.len());
                 let suffix_display: String = g.suffix.chars().take(ghost_len).collect();
                 if !suffix_display.is_empty() {
-                    queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&suffix_display))?;
+                    queue!(
+                        stdout,
+                        crossterm::style::SetForegroundColor(dim),
+                        crossterm::style::Print(&suffix_display)
+                    )?;
                 }
                 let used = prefix_str.len() + suffix_display.len();
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used))))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print(" ".repeat(inner_w.saturating_sub(used)))
+                )?;
             } else {
-                queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+                queue!(
+                    stdout,
+                    crossterm::style::SetForegroundColor(fg),
+                    crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w))
+                )?;
             }
         } else {
-            queue!(stdout, crossterm::style::SetForegroundColor(fg), crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w)))?;
+            queue!(
+                stdout,
+                crossterm::style::SetForegroundColor(fg),
+                crossterm::style::Print(&format!("{:<width$}", line1, width = inner_w))
+            )?;
         }
     }
-    queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r3), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + w_u - 1, r3),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('│')
+    )?;
 
     // Row 4: optional second line
     let r4 = top_row + 4;
-    queue!(stdout, cursor::MoveTo(top_left, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
-    queue!(stdout, crossterm::style::SetForegroundColor(dim), crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w)))?;
-    queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r4), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, r4),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('│')
+    )?;
+    queue!(
+        stdout,
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print(&format!("{:<width$}", line2, width = inner_w))
+    )?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left + w_u - 1, r4),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('│')
+    )?;
 
     // Empty rows
     for i in 5..h.saturating_sub(1) {
         let r = top_row + i as u16;
-        queue!(stdout, cursor::MoveTo(top_left, r), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left, r),
+            crossterm::style::SetForegroundColor(dim),
+            crossterm::style::Print('│')
+        )?;
         queue!(stdout, crossterm::style::Print(" ".repeat(inner_w)))?;
-        queue!(stdout, cursor::MoveTo(top_left + w_u - 1, r), crossterm::style::Print('│'))?;
+        queue!(
+            stdout,
+            cursor::MoveTo(top_left + w_u - 1, r),
+            crossterm::style::Print('│')
+        )?;
     }
 
     // Bottom separator
     let bottom_row = top_row + h_u - 1;
-    queue!(stdout, cursor::MoveTo(top_left, bottom_row), crossterm::style::SetForegroundColor(dim), crossterm::style::Print('╰'), crossterm::style::Print("─".repeat(inner_w)), crossterm::style::Print('╯'))?;
+    queue!(
+        stdout,
+        cursor::MoveTo(top_left, bottom_row),
+        crossterm::style::SetForegroundColor(dim),
+        crossterm::style::Print('╰'),
+        crossterm::style::Print("─".repeat(inner_w)),
+        crossterm::style::Print('╯')
+    )?;
 
     stdout.flush()?;
     Ok(())
@@ -1812,12 +2335,13 @@ fn render_ai_bar(
 fn render(
     screen: &Screen,
     selection: Option<&Selection>,
-    art_height: usize,
+    banner_height: usize,
     theme: &Theme,
     ai_bar_visible: bool,
     current_model: Option<&str>,
     ghost: Option<&GhostSuggestion>,
     input_line_command_prefix: Option<&str>, // command part from shadow_line so ghost shows immediately when PTY echo is one frame behind
+    viewport_scroll: usize,
     stdout: &mut io::Stdout,
 ) -> io::Result<()> {
     let (term_rows, term_cols) = terminal::size()
@@ -1827,10 +2351,14 @@ fn render(
     let art_width = art_line_list.iter().map(|l| l.len()).max().unwrap_or(0);
     let start_col = term_cols.saturating_sub(art_width) / 2;
 
-    // Draw art at top (rows 0..art_height)
+    // Draw welcome art at top (rows 0..banner_height); hidden once the user runs a command.
     for (i, line) in art_line_list.iter().enumerate() {
-        if i < art_height {
-            queue!(stdout, cursor::MoveTo(start_col as u16, i as u16), crossterm::style::Print(line))?;
+        if i < banner_height {
+            queue!(
+                stdout,
+                cursor::MoveTo(start_col as u16, i as u16),
+                crossterm::style::Print(line)
+            )?;
         }
     }
 
@@ -1840,15 +2368,36 @@ fn render(
     } else {
         screen.rows
     };
-    let top_offset = art_height;
+    let sct = screen.scrollback.len();
+    let total = sct + screen.rows;
+    let max_scroll = total.saturating_sub(grid_rows);
+    let viewport_scroll = viewport_scroll.min(max_scroll);
+    let first_doc = total
+        .saturating_sub(grid_rows)
+        .saturating_sub(viewport_scroll);
+    let empty_row: Vec<Cell> = vec![Cell::default(); screen.cols];
+    let empty = empty_row.as_slice();
+    let sel_for_draw = if viewport_scroll > 0 { None } else { selection };
+    let top_offset = banner_height;
     queue!(stdout, cursor::MoveTo(0, top_offset as u16))?;
-    let mut last_fg = 255;
-    let mut last_bg = 255;
+    let mut last_fg = 255u8;
+    let mut last_bg = 255u8;
+    let mut last_fg_rgb: Option<(u8, u8, u8)> = None;
+    let mut last_bg_rgb: Option<(u8, u8, u8)> = None;
     let mut last_bold = false;
-    for (r, row) in screen.grid.iter().take(grid_rows).enumerate() {
-        // Syntax highlighting: first word of command on input line (last row) in a distinct color
-        let (first_word_start_col, first_word_end_col) = if r == grid_rows.saturating_sub(1) {
-            let line: String = row.iter().map(|cell| cell.ch).collect();
+    for dr in 0..grid_rows {
+        let doc_line = first_doc + dr;
+        let row = screen.doc_row_slice(doc_line, empty);
+        let is_shell_line =
+            viewport_scroll == 0 && doc_line == total.saturating_sub(1) && doc_line >= sct;
+        let grid_r = doc_line.saturating_sub(sct);
+        // Syntax highlighting: first word on the live shell input line only
+        let (first_word_start_col, first_word_end_col) = if is_shell_line {
+            let line: String = row
+                .iter()
+                .filter(|cell| !cell.wide_continuation)
+                .map(|cell| cell.ch)
+                .collect();
             let trimmed = line.trim_start();
             let cmd = command_part_of_line(trimmed);
             let first_word = cmd.split_whitespace().next().unwrap_or("");
@@ -1861,12 +2410,12 @@ fn render(
             (0, 0)
         };
 
-        for (c, cell) in row.iter().enumerate() {
-            let in_selection = selection
+        for (c, cell) in row.iter().enumerate().take(screen.cols) {
+            let in_selection = sel_for_draw
                 .filter(|s| !s.is_empty())
-                .map(|s| s.contains_cell(r, c))
+                .map(|s| s.contains_cell(grid_r, c))
                 .unwrap_or(false);
-            let draw_r = top_offset + r;
+            let draw_r = top_offset + dr;
             let draw_c = c;
 
             if in_selection {
@@ -1878,51 +2427,64 @@ fn render(
                 )?;
                 last_fg = 255;
                 last_bg = 255;
+                last_fg_rgb = None;
+                last_bg_rgb = None;
                 last_bold = false;
-            } else if cell.fg != last_fg || cell.bg != last_bg || cell.bold != last_bold {
+            } else if cell.fg != last_fg
+                || cell.bg != last_bg
+                || cell.fg_rgb != last_fg_rgb
+                || cell.bg_rgb != last_bg_rgb
+                || cell.bold != last_bold
+            {
                 let syntax_highlight_first_word =
-                    r == grid_rows.saturating_sub(1) && c >= first_word_start_col && c < first_word_end_col;
+                    is_shell_line && c >= first_word_start_col && c < first_word_end_col;
                 let fg = if syntax_highlight_first_word {
                     crossterm::style::Color::DarkCyan
+                } else if let Some((r, g, b)) = cell.fg_rgb {
+                    crossterm::style::Color::Rgb { r, g, b }
                 } else {
                     match cell.fg {
-                    0 => crossterm::style::Color::Black,
-                    1 => crossterm::style::Color::DarkRed,
-                    2 => crossterm::style::Color::DarkGreen,
-                    3 => crossterm::style::Color::DarkYellow,
-                    4 => crossterm::style::Color::DarkBlue,
-                    5 => crossterm::style::Color::DarkMagenta,
-                    6 => crossterm::style::Color::DarkCyan,
-                    7 => crossterm::style::Color::Rgb {
-                        r: theme.default_foreground.0,
-                        g: theme.default_foreground.1,
-                        b: theme.default_foreground.2,
-                    },
-                    _ => crossterm::style::Color::Rgb {
-                        r: theme.default_foreground.0,
-                        g: theme.default_foreground.1,
-                        b: theme.default_foreground.2,
-                    },
-                }
+                        0 => crossterm::style::Color::Black,
+                        1 => crossterm::style::Color::DarkRed,
+                        2 => crossterm::style::Color::DarkGreen,
+                        3 => crossterm::style::Color::DarkYellow,
+                        4 => crossterm::style::Color::DarkBlue,
+                        5 => crossterm::style::Color::DarkMagenta,
+                        6 => crossterm::style::Color::DarkCyan,
+                        7 => crossterm::style::Color::Rgb {
+                            r: theme.default_foreground.0,
+                            g: theme.default_foreground.1,
+                            b: theme.default_foreground.2,
+                        },
+                        _ => crossterm::style::Color::Rgb {
+                            r: theme.default_foreground.0,
+                            g: theme.default_foreground.1,
+                            b: theme.default_foreground.2,
+                        },
+                    }
                 };
-                let bg = match cell.bg {
-                    0 => crossterm::style::Color::Rgb {
-                        r: theme.default_background.0,
-                        g: theme.default_background.1,
-                        b: theme.default_background.2,
-                    },
-                    1 => crossterm::style::Color::DarkRed,
-                    2 => crossterm::style::Color::DarkGreen,
-                    3 => crossterm::style::Color::DarkYellow,
-                    4 => crossterm::style::Color::DarkBlue,
-                    5 => crossterm::style::Color::DarkMagenta,
-                    6 => crossterm::style::Color::DarkCyan,
-                    7 => crossterm::style::Color::Grey,
-                    _ => crossterm::style::Color::Rgb {
-                        r: theme.default_background.0,
-                        g: theme.default_background.1,
-                        b: theme.default_background.2,
-                    },
+                let bg = if let Some((r, g, b)) = cell.bg_rgb {
+                    crossterm::style::Color::Rgb { r, g, b }
+                } else {
+                    match cell.bg {
+                        0 => crossterm::style::Color::Rgb {
+                            r: theme.default_background.0,
+                            g: theme.default_background.1,
+                            b: theme.default_background.2,
+                        },
+                        1 => crossterm::style::Color::DarkRed,
+                        2 => crossterm::style::Color::DarkGreen,
+                        3 => crossterm::style::Color::DarkYellow,
+                        4 => crossterm::style::Color::DarkBlue,
+                        5 => crossterm::style::Color::DarkMagenta,
+                        6 => crossterm::style::Color::DarkCyan,
+                        7 => crossterm::style::Color::Grey,
+                        _ => crossterm::style::Color::Rgb {
+                            r: theme.default_background.0,
+                            g: theme.default_background.1,
+                            b: theme.default_background.2,
+                        },
+                    }
                 };
                 queue!(
                     stdout,
@@ -1930,15 +2492,30 @@ fn render(
                     crossterm::style::SetBackgroundColor(bg)
                 )?;
                 if cell.bold {
-                    queue!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::Bold))?;
+                    queue!(
+                        stdout,
+                        crossterm::style::SetAttribute(crossterm::style::Attribute::Bold)
+                    )?;
                 } else if last_bold {
-                    queue!(stdout, crossterm::style::SetAttribute(crossterm::style::Attribute::NormalIntensity))?;
+                    queue!(
+                        stdout,
+                        crossterm::style::SetAttribute(
+                            crossterm::style::Attribute::NormalIntensity
+                        )
+                    )?;
                 }
                 last_fg = cell.fg;
                 last_bg = cell.bg;
+                last_fg_rgb = cell.fg_rgb;
+                last_bg_rgb = cell.bg_rgb;
                 last_bold = cell.bold;
             }
-            queue!(stdout, cursor::MoveTo(draw_c as u16, draw_r as u16), crossterm::style::Print(cell.ch))?;
+            let ch = if cell.wide_continuation { ' ' } else { cell.ch };
+            queue!(
+                stdout,
+                cursor::MoveTo(draw_c as u16, draw_r as u16),
+                crossterm::style::Print(ch)
+            )?;
         }
     }
     // Bottom left: show selected AI model name when set
@@ -1970,39 +2547,55 @@ fn render(
     // Ghost text overlay: dimmed suggestion after cursor (on the line where the cursor is, when command part matches).
     // Show on the current cursor line, not only "last row" — at shell prompt the cursor is usually on row 0.
     // Use input_line_command_prefix (main-thread shadow) so ghost appears immediately on keypress even if PTY echo is one frame behind.
-    if let Some(g) = ghost {
-        let line_at_cursor = screen.line_prefix_at_cursor();
-        let screen_prefix = command_part_of_line(line_at_cursor.trim());
-        let prefix_matches = screen_prefix == g.for_prefix
-            || input_line_command_prefix.map(|p| p == g.for_prefix).unwrap_or(false);
-        if prefix_matches
-            && screen.cursor_row < grid_rows
-            && screen.cursor_col < screen.cols
-        {
-            let dim = crossterm::style::Color::Rgb { r: 0x66, g: 0x66, b: 0x66 };
-            let max_suffix_len = screen.cols.saturating_sub(screen.cursor_col);
-            let suffix: String = g.suffix.chars().take(max_suffix_len).collect();
-            let ghost_row = (top_offset + screen.cursor_row) as u16;
-            let mut col = screen.cursor_col as u16;
-            queue!(stdout, crossterm::style::SetForegroundColor(dim))?;
-            for ch in suffix.chars() {
-                if col >= screen.cols as u16 {
-                    break;
+    if viewport_scroll == 0 {
+        if let Some(g) = ghost {
+            let line_at_cursor = screen.line_prefix_at_cursor();
+            let screen_prefix = command_part_of_line(line_at_cursor.trim());
+            let prefix_matches = screen_prefix == g.for_prefix
+                || input_line_command_prefix
+                    .map(|p| p == g.for_prefix)
+                    .unwrap_or(false);
+            let dr_cursor = (sct + screen.cursor_row).saturating_sub(first_doc);
+            if prefix_matches && dr_cursor < grid_rows && screen.cursor_col < screen.cols {
+                let dim = crossterm::style::Color::Rgb {
+                    r: 0x66,
+                    g: 0x66,
+                    b: 0x66,
+                };
+                let max_suffix_len = screen.cols.saturating_sub(screen.cursor_col);
+                let suffix: String = g.suffix.chars().take(max_suffix_len).collect();
+                let ghost_row = (top_offset + dr_cursor) as u16;
+                let mut col = screen.cursor_col as u16;
+                queue!(stdout, crossterm::style::SetForegroundColor(dim))?;
+                for ch in suffix.chars() {
+                    if col >= screen.cols as u16 {
+                        break;
+                    }
+                    queue!(
+                        stdout,
+                        cursor::MoveTo(col, ghost_row),
+                        crossterm::style::Print(ch)
+                    )?;
+                    col += 1;
                 }
-                queue!(stdout, cursor::MoveTo(col, ghost_row), crossterm::style::Print(ch))?;
-                col += 1;
             }
         }
     }
 
-    queue!(
-        stdout,
-        cursor::MoveTo(
-            screen.cursor_col as u16,
-            (top_offset + screen.cursor_row) as u16
-        ),
-        cursor::Show
-    )?;
+    if viewport_scroll == 0 {
+        let dr_cursor = (sct + screen.cursor_row).saturating_sub(first_doc);
+        if dr_cursor < grid_rows {
+            queue!(
+                stdout,
+                cursor::MoveTo(screen.cursor_col as u16, (top_offset + dr_cursor) as u16),
+                cursor::Show
+            )?;
+        } else {
+            queue!(stdout, cursor::Hide)?;
+        }
+    } else {
+        queue!(stdout, cursor::Hide)?;
+    }
     stdout.flush()?;
     Ok(())
 }
@@ -2022,6 +2615,26 @@ const WELCOME_ART: &str = r#"
 
 fn art_lines() -> Vec<&'static str> {
     WELCOME_ART.trim_start_matches('\n').lines().collect()
+}
+
+/// Resize PTY and screen grid for the current terminal size and reserved welcome-banner rows.
+fn sync_pty_with_banner(
+    master: &dyn MasterPty,
+    screen: &Arc<Mutex<Screen>>,
+    banner_height: usize,
+    term_cols: u16,
+    term_rows: u16,
+) {
+    let new_rows = (term_rows as usize).saturating_sub(banner_height).max(1);
+    let _ = master.resize(PtySize {
+        rows: new_rows as u16,
+        cols: term_cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    if let Ok(mut s) = screen.lock() {
+        s.resize(new_rows, term_cols as usize);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2056,8 +2669,16 @@ fn main() -> io::Result<()> {
         .map(|(c, r)| (r as usize, c as usize))
         .unwrap_or((24, 80));
 
-    let art_height = art_lines().len();
-    let rows = term_rows.saturating_sub(art_height).max(1);
+    let (user_abbrevs, config_show_banner) = load_runtime_opts_from_disk();
+    let abbrev_merged = Arc::new(Mutex::new(merged_abbrev_map(&user_abbrevs)));
+    let runtime_show_banner = Arc::new(Mutex::new(config_show_banner));
+
+    let mut banner_height = if *runtime_show_banner.lock().unwrap() {
+        art_lines().len()
+    } else {
+        0
+    };
+    let rows = term_rows.saturating_sub(banner_height).max(1);
     let cols = term_cols;
 
     let theme = Arc::new(Mutex::new(load_theme()));
@@ -2136,6 +2757,8 @@ fn main() -> io::Result<()> {
     });
 
     execute!(stdout, event::EnableMouseCapture)?;
+    let _ = pty_writer.write_all(b"\x1b[?2004h");
+    let _ = pty_writer.flush();
 
     // Selection state: drag updates end; Ctrl+Shift+C copies. Copy on release (traditional).
     // Double-click = word, triple-click = line.
@@ -2148,7 +2771,9 @@ fn main() -> io::Result<()> {
     let mut ai_config = load_ai_config();
     let mut backend_override: Option<AiBackend> = None;
     let mut model_override: Option<String> = None;
-    let (ai_tx, ai_rx) = mpsc::channel();
+    let (ai_tx, ai_rx) = mpsc::channel::<(u64, Result<String, String>)>();
+    let mut ai_active_job: Option<u64> = None;
+    let mut ai_job_counter: u64 = 0;
     let mut ai_mode = AiMode::Idle;
     const CMD_SYSTEM: &str = "You are a shell assistant. Reply with exactly one shell command, no explanation, no markdown code blocks.";
     const COMPLETE_SYSTEM: &str = "You are a shell assistant. The user has typed a partial shell command. Reply with the COMPLETE command on one line: first the exact characters they already typed, then the rest (complete the word and add the full command). Your reply must start with their text. Example: if they typed 'git clo' reply 'git clone https://github.com/user/repo.git' or 'git clone <repo>'. No explanation, no markdown.";
@@ -2161,14 +2786,18 @@ fn main() -> io::Result<()> {
     const GHOST_AI_DEBOUNCE_MS: u64 = 400;
     const GHOST_MIN_PREFIX_LEN: usize = 1;
     const GHOST_AI_MIN_PREFIX_LEN: usize = 2; // require 2+ chars before calling API
-    let (ghost_tx, ghost_rx) = mpsc::channel::<(String, String)>();
+    let (ghost_tx, ghost_rx) = mpsc::channel::<(u64, String, String)>();
+    let mut ghost_request_gen: u64 = 0;
     let mut shell_history = load_shell_history();
 
     // AI bar (Ctrl+K) ghost: completion in the prompt input
     let mut ai_bar_ghost: Option<GhostSuggestion> = None;
     let mut last_ai_bar_ghost_key: Option<Instant> = None;
     let mut ai_bar_ghost_pending = false;
-    let (ai_bar_ghost_tx, ai_bar_ghost_rx) = mpsc::channel::<(String, String)>();
+    let (ai_bar_ghost_tx, ai_bar_ghost_rx) = mpsc::channel::<(u64, String, String)>();
+    let mut ai_bar_ghost_request_gen: u64 = 0;
+
+    let mut viewport_scroll: usize = 0;
 
     while running.load(Ordering::Relaxed) {
         // Exit when shell exits (Ctrl+D or `exit`)
@@ -2180,9 +2809,7 @@ fn main() -> io::Result<()> {
             screen_dirty.store(true, Ordering::Relaxed);
             match event::read() {
                 Ok(Event::Key(KeyEvent {
-                    code,
-                    modifiers,
-                    ..
+                    code, modifiers, ..
                 })) => {
                     // Ctrl+Shift+C: copy selection to clipboard (do not send to PTY)
                     if modifiers.contains(KeyModifiers::CONTROL)
@@ -2207,7 +2834,22 @@ fn main() -> io::Result<()> {
                         && modifiers.contains(KeyModifiers::SHIFT)
                         && matches!(code, KeyCode::Char(c) if c == 't' || c == 'T')
                     {
-                        let _ = open_theme_config_and_reload(&mut stdout, &theme);
+                        let _ = open_theme_config_and_reload(
+                            &mut stdout,
+                            &theme,
+                            &abbrev_merged,
+                            &runtime_show_banner,
+                        );
+                        let show = *runtime_show_banner.lock().unwrap();
+                        // Turning the banner off in config always frees rows; turning it on does not
+                        // undo an in-session dismiss (Enter already hid the welcome art).
+                        if !show && banner_height > 0 {
+                            banner_height = 0;
+                            if let Ok((cols, rows)) = terminal::size() {
+                                sync_pty_with_banner(&*master, &screen, 0, cols, rows);
+                            }
+                        }
+                        screen_dirty.store(true, Ordering::Relaxed);
                         continue;
                     }
 
@@ -2229,130 +2871,192 @@ fn main() -> io::Result<()> {
                     if !matches!(ai_mode, AiMode::Idle) {
                         // Poll for worker result when Thinking
                         if matches!(ai_mode, AiMode::Thinking) {
-                            if let Ok(res) = ai_rx.try_recv() {
-                                ai_mode = match res {
-                                    Ok(cmd) => AiMode::SuggestionReady { command: cmd },
-                                    Err(e) => AiMode::Error { message: e },
-                                };
+                            if let Ok((jid, res)) = ai_rx.try_recv() {
+                                if ai_active_job == Some(jid) {
+                                    ai_active_job = None;
+                                    ai_mode = match res {
+                                        Ok(cmd) => ai_suggestion_ready(cmd),
+                                        Err(e) => AiMode::Error { message: e },
+                                    };
+                                    screen_dirty.store(true, Ordering::Relaxed);
+                                }
                             }
                         }
                         let mut exit_wizard_to_idle = false;
                         let mut reload_ai_config = false;
                         match &mut ai_mode {
-                            AiMode::PromptInput { buffer } => {
-                                match code {
-                                    KeyCode::Char(c) if !c.is_control() => {
-                                        buffer.push(c);
-                                        last_ai_bar_ghost_key = Some(Instant::now());
-                                        ai_bar_ghost = None;
+                            AiMode::PromptInput { buffer } => match code {
+                                KeyCode::Char(c) if !c.is_control() => {
+                                    buffer.push(c);
+                                    last_ai_bar_ghost_key = Some(Instant::now());
+                                    ai_bar_ghost = None;
+                                }
+                                KeyCode::Backspace => {
+                                    buffer.pop();
+                                    last_ai_bar_ghost_key = Some(Instant::now());
+                                    ai_bar_ghost = None;
+                                }
+                                KeyCode::Tab => {
+                                    if ai_bar_ghost
+                                        .as_ref()
+                                        .is_some_and(|g| buffer.trim() == g.for_prefix)
+                                    {
+                                        if let Some(g) = ai_bar_ghost.take() {
+                                            buffer.push_str(&g.suffix);
+                                        }
                                     }
-                                    KeyCode::Backspace => {
-                                        buffer.pop();
-                                        last_ai_bar_ghost_key = Some(Instant::now());
-                                        ai_bar_ghost = None;
+                                }
+                                KeyCode::Enter => {
+                                    let prompt = buffer.trim().to_string();
+                                    if prompt.is_empty() {
+                                        ai_mode = AiMode::Idle;
+                                        shadow_line.clear();
+                                        ghost = None;
+                                    } else if prompt == "/model" || prompt == "/models" {
+                                        let choices = available_backends(&ai_config);
+                                        ai_mode = AiMode::BackendPicker {
+                                            choices,
+                                            selected: 0,
+                                        };
+                                    } else {
+                                        let backend =
+                                            backend_override.unwrap_or(ai_config.default_backend);
+                                        ai_job_counter = ai_job_counter.wrapping_add(1);
+                                        let job_id = ai_job_counter;
+                                        ai_active_job = Some(job_id);
+                                        let tx = ai_tx.clone();
+                                        let config = ai_config.clone();
+                                        let prompt_clone = prompt.clone();
+                                        let model_opt = model_override
+                                            .clone()
+                                            .or_else(|| config.default_model.clone());
+                                        thread::spawn(move || {
+                                            let res = match backend {
+                                                AiBackend::Ollama => {
+                                                    let model = match ollama_resolve_model(
+                                                        &config.ollama_base_url,
+                                                        model_opt.as_deref(),
+                                                    ) {
+                                                        Ok(m) => m,
+                                                        Err(e) => {
+                                                            let _ = tx.send((job_id, Err(e)));
+                                                            return;
+                                                        }
+                                                    };
+                                                    let full_prompt = ollama_build_prompt(
+                                                        CMD_SYSTEM,
+                                                        &prompt_clone,
+                                                    );
+                                                    ollama_generate(
+                                                        &config.ollama_base_url,
+                                                        &model,
+                                                        &full_prompt,
+                                                    )
+                                                }
+                                                AiBackend::OpenAi => {
+                                                    let api_key = match config.openai_api_key() {
+                                                        Some(k) => k,
+                                                        None => {
+                                                            let _ = tx.send((job_id, Err("Set OPENAI_API_KEY or configure in /model → Configure API".to_string())));
+                                                            return;
+                                                        }
+                                                    };
+                                                    let model = model_opt.unwrap_or_else(|| {
+                                                        "gpt-4o-mini".to_string()
+                                                    });
+                                                    let base = config.openai_base_url();
+                                                    openai_generate(
+                                                        &base,
+                                                        &api_key,
+                                                        &model,
+                                                        CMD_SYSTEM,
+                                                        &prompt_clone,
+                                                    )
+                                                }
+                                                AiBackend::Gemini => {
+                                                    let api_key = match config.gemini_api_key() {
+                                                        Some(k) => k,
+                                                        None => {
+                                                            let _ = tx.send((job_id, Err("Set GEMINI_API_KEY or configure in /model → Configure API".to_string())));
+                                                            return;
+                                                        }
+                                                    };
+                                                    let model = model_opt.unwrap_or_else(|| {
+                                                        "gemini-2.0-flash".to_string()
+                                                    });
+                                                    gemini_generate(
+                                                        &api_key,
+                                                        &model,
+                                                        CMD_SYSTEM,
+                                                        &prompt_clone,
+                                                    )
+                                                }
+                                                AiBackend::Groq => {
+                                                    let api_key = match config.groq_api_key() {
+                                                        Some(k) => k,
+                                                        None => {
+                                                            let _ = tx.send((job_id, Err("Set GROQ_API_KEY or configure in /model → Configure API".to_string())));
+                                                            return;
+                                                        }
+                                                    };
+                                                    let model = model_opt.unwrap_or_else(|| {
+                                                        "llama-3.3-70b-versatile".to_string()
+                                                    });
+                                                    let base = config.groq_base_url();
+                                                    openai_generate(
+                                                        &base,
+                                                        &api_key,
+                                                        &model,
+                                                        CMD_SYSTEM,
+                                                        &prompt_clone,
+                                                    )
+                                                }
+                                            };
+                                            let _ = tx.send((job_id, res));
+                                        });
+                                        ai_mode = AiMode::Thinking;
                                     }
-                                    KeyCode::Tab => {
-                                        if ai_bar_ghost.as_ref().is_some_and(|g| buffer.trim() == g.for_prefix) {
-                                            if let Some(g) = ai_bar_ghost.take() {
-                                                buffer.push_str(&g.suffix);
+                                }
+                                KeyCode::Esc => {
+                                    ai_mode = AiMode::Idle;
+                                }
+                                _ => {}
+                            },
+                            AiMode::SuggestionReady {
+                                command,
+                                risk_hint,
+                                destructive_confirmed,
+                            } => {
+                                if code == KeyCode::Enter {
+                                    if risk_hint.is_some() && !*destructive_confirmed {
+                                        *destructive_confirmed = true;
+                                        screen_dirty.store(true, Ordering::Relaxed);
+                                    } else {
+                                        for c in command.chars() {
+                                            let bytes = key_to_bytes(
+                                                KeyCode::Char(c),
+                                                KeyModifiers::empty(),
+                                            );
+                                            for b in bytes {
+                                                let _ = pty_writer.write_all(&[b]);
                                             }
                                         }
-                                    }
-                                    KeyCode::Enter => {
-                                        let prompt = buffer.trim().to_string();
-                                        if prompt.is_empty() {
-                                            ai_mode = AiMode::Idle;
-                                            shadow_line.clear();
-                                            ghost = None;
-                                        } else if prompt == "/model" || prompt == "/models" {
-                                            let choices = available_backends(&ai_config);
-                                            ai_mode = AiMode::BackendPicker {
-                                                choices,
-                                                selected: 0,
-                                            };
-                                        } else {
-                                            let backend = backend_override.unwrap_or(ai_config.default_backend);
-                                            let tx = ai_tx.clone();
-                                            let config = ai_config.clone();
-                                            let prompt_clone = prompt.clone();
-                                            let model_opt = model_override.clone().or_else(|| config.default_model.clone());
-                                            thread::spawn(move || {
-                                                let res = match backend {
-                                                    AiBackend::Ollama => {
-                                                        let model = match ollama_resolve_model(
-                                                            &config.ollama_base_url,
-                                                            model_opt.as_deref(),
-                                                        ) {
-                                                            Ok(m) => m,
-                                                            Err(e) => {
-                                                                let _ = tx.send(Err(e));
-                                                                return;
-                                                            }
-                                                        };
-                                                        let full_prompt = ollama_build_prompt(CMD_SYSTEM, &prompt_clone);
-                                                        ollama_generate(&config.ollama_base_url, &model, &full_prompt)
-                                                    }
-                                                    AiBackend::OpenAi => {
-                                                        let api_key = match config.openai_api_key() {
-                                                            Some(k) => k,
-                                                            None => {
-                                                                let _ = tx.send(Err("Set OPENAI_API_KEY or configure in /model → Configure API".to_string()));
-                                                                return;
-                                                            }
-                                                        };
-                                                        let model = model_opt.unwrap_or_else(|| "gpt-4o-mini".to_string());
-                                                        let base = config.openai_base_url();
-                                                        openai_generate(&base, &api_key, &model, CMD_SYSTEM, &prompt_clone)
-                                                    }
-                                                    AiBackend::Gemini => {
-                                                        let api_key = match config.gemini_api_key() {
-                                                            Some(k) => k,
-                                                            None => {
-                                                                let _ = tx.send(Err("Set GEMINI_API_KEY or configure in /model → Configure API".to_string()));
-                                                                return;
-                                                            }
-                                                        };
-                                                        let model = model_opt.unwrap_or_else(|| "gemini-2.0-flash".to_string());
-                                                        gemini_generate(&api_key, &model, CMD_SYSTEM, &prompt_clone)
-                                                    }
-                                                    AiBackend::Groq => {
-                                                        let api_key = match config.groq_api_key() {
-                                                            Some(k) => k,
-                                                            None => {
-                                                                let _ = tx.send(Err("Set GROQ_API_KEY or configure in /model → Configure API".to_string()));
-                                                                return;
-                                                            }
-                                                        };
-                                                        let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
-                                                        let base = config.groq_base_url();
-                                                        openai_generate(&base, &api_key, &model, CMD_SYSTEM, &prompt_clone)
-                                                    }
-                                                };
-                                                let _ = tx.send(res);
-                                            });
-                                            ai_mode = AiMode::Thinking;
+                                        let _ = pty_writer.write_all(&[b'\r']);
+                                        let _ = pty_writer.flush();
+                                        viewport_scroll = 0;
+                                        if banner_height > 0 {
+                                            banner_height = 0;
+                                            if let Ok((cols, rows)) = terminal::size() {
+                                                sync_pty_with_banner(
+                                                    &*master, &screen, 0, cols, rows,
+                                                );
+                                            }
                                         }
-                                    }
-                                    KeyCode::Esc => {
+                                        screen_dirty.store(true, Ordering::Relaxed);
                                         ai_mode = AiMode::Idle;
+                                        shadow_line.clear();
+                                        ghost = None;
                                     }
-                                    _ => {}
-                                }
-                            }
-                            AiMode::SuggestionReady { command } => {
-                                if code == KeyCode::Enter {
-                                    // Inject command into PTY and run
-                                    for c in command.chars() {
-                                        let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
-                                        for b in bytes {
-                                            let _ = pty_writer.write_all(&[b]);
-                                        }
-                                    }
-                                    let _ = pty_writer.write_all(&[b'\r']);
-                                    let _ = pty_writer.flush();
-                                    ai_mode = AiMode::Idle;
-                                    shadow_line.clear();
-                                    ghost = None;
                                 } else if code == KeyCode::Esc {
                                     ai_mode = AiMode::Idle;
                                     shadow_line.clear();
@@ -2364,215 +3068,230 @@ fn main() -> io::Result<()> {
                                     ai_mode = AiMode::Idle;
                                 }
                             }
-                            AiMode::BackendPicker { choices, selected } => {
-                                match code {
-                                    KeyCode::Up => {
-                                        *selected = selected.saturating_sub(1);
-                                    }
-                                    KeyCode::Down => {
-                                        *selected = (*selected + 1).min(choices.len().saturating_sub(1));
-                                    }
-                                    KeyCode::Enter => {
-                                        let choice = choices[*selected].clone();
-                                        match choice {
-                                            BackendChoice::ConfigureApi => {
-                                                ai_mode = AiMode::ConfigApiWizard {
-                                                    step: ConfigApiStep::ChooseProvider { selected: 0 },
-                                                };
-                                            }
-                                            BackendChoice::RemoveApi => {
-                                                let backends: Vec<AiBackend> = [AiBackend::OpenAi, AiBackend::Gemini, AiBackend::Groq]
-                                                    .into_iter()
-                                                    .filter(|b| ai_config.is_configured(*b))
-                                                    .collect();
-                                                ai_mode = AiMode::RemoveApiPicker {
-                                                    backends,
-                                                    selected: 0,
-                                                };
-                                            }
-                                            BackendChoice::Backend(backend) => {
-                                                let models = match backend {
-                                                    AiBackend::Ollama => {
-                                                        match ollama_list_models(&ai_config.ollama_base_url) {
-                                                            Ok(list) if !list.is_empty() => list,
-                                                            Ok(_) => {
-                                                                ai_mode = AiMode::Error {
+                            AiMode::BackendPicker { choices, selected } => match code {
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    *selected =
+                                        (*selected + 1).min(choices.len().saturating_sub(1));
+                                }
+                                KeyCode::Enter => {
+                                    let choice = choices[*selected].clone();
+                                    match choice {
+                                        BackendChoice::ConfigureApi => {
+                                            ai_mode = AiMode::ConfigApiWizard {
+                                                step: ConfigApiStep::ChooseProvider { selected: 0 },
+                                            };
+                                        }
+                                        BackendChoice::RemoveApi => {
+                                            let backends: Vec<AiBackend> = [
+                                                AiBackend::OpenAi,
+                                                AiBackend::Gemini,
+                                                AiBackend::Groq,
+                                            ]
+                                            .into_iter()
+                                            .filter(|b| ai_config.is_configured(*b))
+                                            .collect();
+                                            ai_mode = AiMode::RemoveApiPicker {
+                                                backends,
+                                                selected: 0,
+                                            };
+                                        }
+                                        BackendChoice::Backend(backend) => {
+                                            let models = match backend {
+                                                AiBackend::Ollama => {
+                                                    match ollama_list_models(
+                                                        &ai_config.ollama_base_url,
+                                                    ) {
+                                                        Ok(list) if !list.is_empty() => list,
+                                                        Ok(_) => {
+                                                            ai_mode = AiMode::Error {
                                                                     message: "No Ollama models. Pull one with: ollama pull <name>".to_string(),
                                                                 };
-                                                                continue;
-                                                            }
-                                                            Err(e) => {
-                                                                ai_mode = AiMode::Error { message: e };
-                                                                continue;
-                                                            }
+                                                            continue;
+                                                        }
+                                                        Err(e) => {
+                                                            ai_mode = AiMode::Error { message: e };
+                                                            continue;
                                                         }
                                                     }
-                                                    AiBackend::OpenAi => {
-                                                        let key = ai_config.openai_api_key().unwrap_or_default();
-                                                        openai_list_models(&ai_config.openai_base_url(), &key)
-                                                    }
-                                                    AiBackend::Gemini => gemini_list_models(),
-                                                    AiBackend::Groq => groq_list_models(),
-                                                };
-                                                ai_mode = AiMode::ModelPicker {
-                                                    backend,
-                                                    models,
-                                                    selected: 0,
-                                                };
-                                            }
+                                                }
+                                                AiBackend::OpenAi => {
+                                                    let key = ai_config
+                                                        .openai_api_key()
+                                                        .unwrap_or_default();
+                                                    openai_list_models(
+                                                        &ai_config.openai_base_url(),
+                                                        &key,
+                                                    )
+                                                }
+                                                AiBackend::Gemini => gemini_list_models(),
+                                                AiBackend::Groq => groq_list_models(),
+                                            };
+                                            ai_mode = AiMode::ModelPicker {
+                                                backend,
+                                                models,
+                                                selected: 0,
+                                            };
                                         }
                                     }
-                                    KeyCode::Esc => {
-                                        ai_mode = AiMode::Idle;
-                                    }
-                                    _ => {}
                                 }
-                            }
-                            AiMode::ModelPicker { backend, models, selected } => {
-                                match code {
+                                KeyCode::Esc => {
+                                    ai_mode = AiMode::Idle;
+                                }
+                                _ => {}
+                            },
+                            AiMode::ModelPicker {
+                                backend,
+                                models,
+                                selected,
+                            } => match code {
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    *selected = (*selected + 1).min(models.len().saturating_sub(1));
+                                }
+                                KeyCode::Enter => {
+                                    let chosen = models[*selected].clone();
+                                    backend_override = Some(*backend);
+                                    model_override = Some(chosen);
+                                    ai_mode = AiMode::Idle;
+                                }
+                                KeyCode::Esc => {
+                                    ai_mode = AiMode::Idle;
+                                }
+                                _ => {}
+                            },
+                            AiMode::RemoveApiPicker { backends, selected } => match code {
+                                KeyCode::Up => {
+                                    *selected = selected.saturating_sub(1);
+                                }
+                                KeyCode::Down => {
+                                    *selected =
+                                        (*selected + 1).min(backends.len().saturating_sub(1));
+                                }
+                                KeyCode::Enter => {
+                                    let backend = backends[*selected];
+                                    let provider_name = match backend {
+                                        AiBackend::OpenAi => "openai",
+                                        AiBackend::Gemini => "gemini",
+                                        AiBackend::Groq => "groq",
+                                        AiBackend::Ollama => "ollama",
+                                    };
+                                    match remove_provider_api_key(provider_name) {
+                                        Ok(()) => {
+                                            reload_ai_config = true;
+                                            ai_mode = AiMode::Idle;
+                                        }
+                                        Err(e) => {
+                                            ai_mode = AiMode::Error {
+                                                message: format!("Remove failed: {}", e),
+                                            };
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    ai_mode = AiMode::Idle;
+                                }
+                                _ => {}
+                            },
+                            AiMode::ConfigApiWizard { step } => match step {
+                                ConfigApiStep::ChooseProvider { selected } => match code {
                                     KeyCode::Up => {
                                         *selected = selected.saturating_sub(1);
                                     }
                                     KeyCode::Down => {
-                                        *selected = (*selected + 1).min(models.len().saturating_sub(1));
+                                        *selected = (*selected + 1).min(2);
                                     }
                                     KeyCode::Enter => {
-                                        let chosen = models[*selected].clone();
-                                        backend_override = Some(*backend);
-                                        model_override = Some(chosen);
-                                        ai_mode = AiMode::Idle;
-                                    }
-                                    KeyCode::Esc => {
-                                        ai_mode = AiMode::Idle;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            AiMode::RemoveApiPicker { backends, selected } => {
-                                match code {
-                                    KeyCode::Up => {
-                                        *selected = selected.saturating_sub(1);
-                                    }
-                                    KeyCode::Down => {
-                                        *selected = (*selected + 1).min(backends.len().saturating_sub(1));
-                                    }
-                                    KeyCode::Enter => {
-                                        let backend = backends[*selected];
-                                        let provider_name = match backend {
-                                            AiBackend::OpenAi => "openai",
-                                            AiBackend::Gemini => "gemini",
-                                            AiBackend::Groq => "groq",
-                                            AiBackend::Ollama => "ollama",
+                                        const WIZARD_BACKENDS: [AiBackend; 3] =
+                                            [AiBackend::OpenAi, AiBackend::Gemini, AiBackend::Groq];
+                                        let provider = WIZARD_BACKENDS[*selected];
+                                        ai_mode = AiMode::ConfigApiWizard {
+                                            step: ConfigApiStep::EnterKey {
+                                                provider,
+                                                key_buffer: String::new(),
+                                            },
                                         };
-                                        match remove_provider_api_key(provider_name) {
-                                            Ok(()) => {
-                                                reload_ai_config = true;
-                                                ai_mode = AiMode::Idle;
-                                            }
-                                            Err(e) => {
-                                                ai_mode = AiMode::Error {
-                                                    message: format!("Remove failed: {}", e),
-                                                };
-                                            }
-                                        }
                                     }
                                     KeyCode::Esc => {
                                         ai_mode = AiMode::Idle;
                                     }
                                     _ => {}
-                                }
-                            }
-                            AiMode::ConfigApiWizard { step } => {
-                                match step {
-                                    ConfigApiStep::ChooseProvider { selected } => {
-                                        match code {
-                                            KeyCode::Up => {
-                                                *selected = selected.saturating_sub(1);
-                                            }
-                                            KeyCode::Down => {
-                                                *selected = (*selected + 1).min(2);
-                                            }
-                                            KeyCode::Enter => {
-                                                const WIZARD_BACKENDS: [AiBackend; 3] =
-                                                    [AiBackend::OpenAi, AiBackend::Gemini, AiBackend::Groq];
-                                                let provider = WIZARD_BACKENDS[*selected];
-                                                ai_mode = AiMode::ConfigApiWizard {
-                                                    step: ConfigApiStep::EnterKey {
-                                                        provider,
-                                                        key_buffer: String::new(),
-                                                    },
-                                                };
-                                            }
-                                            KeyCode::Esc => {
-                                                ai_mode = AiMode::Idle;
-                                            }
-                                            _ => {}
-                                        }
+                                },
+                                ConfigApiStep::EnterKey {
+                                    provider,
+                                    key_buffer,
+                                } => match code {
+                                    KeyCode::Char(c) if !c.is_control() => {
+                                        key_buffer.push(c);
                                     }
-                                    ConfigApiStep::EnterKey { provider, key_buffer } => {
-                                        match code {
-                                            KeyCode::Char(c) if !c.is_control() => {
-                                                key_buffer.push(c);
-                                            }
-                                            KeyCode::Backspace => {
-                                                key_buffer.pop();
-                                            }
-                                            KeyCode::Enter => {
-                                                let key = key_buffer.trim();
-                                                if key.is_empty() {
+                                    KeyCode::Backspace => {
+                                        key_buffer.pop();
+                                    }
+                                    KeyCode::Enter => {
+                                        let key = key_buffer.trim();
+                                        if key.is_empty() {
+                                            ai_mode = AiMode::ConfigApiWizard {
+                                                step: ConfigApiStep::Done {
+                                                    message: format!(
+                                                        "Set {} env var or add key in config.",
+                                                        match provider {
+                                                            AiBackend::OpenAi => "OPENAI_API_KEY",
+                                                            AiBackend::Gemini => "GEMINI_API_KEY",
+                                                            AiBackend::Groq => "GROQ_API_KEY",
+                                                            AiBackend::Ollama =>
+                                                                "N/A (Ollama needs no key)",
+                                                        }
+                                                    ),
+                                                },
+                                            };
+                                        } else {
+                                            let provider_name = match provider {
+                                                AiBackend::OpenAi => "openai",
+                                                AiBackend::Gemini => "gemini",
+                                                AiBackend::Groq => "groq",
+                                                AiBackend::Ollama => "ollama",
+                                            };
+                                            match write_provider_api_key(provider_name, key) {
+                                                Ok(()) => {
+                                                    reload_ai_config = true;
                                                     ai_mode = AiMode::ConfigApiWizard {
-                                                        step: ConfigApiStep::Done {
-                                                            message: format!(
-                                                                "Set {} env var or add key in config.",
-                                                                match provider {
-                                                                    AiBackend::OpenAi => "OPENAI_API_KEY",
-                                                                    AiBackend::Gemini => "GEMINI_API_KEY",
-                                                                    AiBackend::Groq => "GROQ_API_KEY",
-                                                                    AiBackend::Ollama => "N/A (Ollama needs no key)",
-                                                                }
-                                                            ),
-                                                        },
-                                                    };
-                                                } else {
-                                                    let provider_name = match provider {
-                                                        AiBackend::OpenAi => "openai",
-                                                        AiBackend::Gemini => "gemini",
-                                                        AiBackend::Groq => "groq",
-                                                        AiBackend::Ollama => "ollama",
-                                                    };
-                                                    match write_provider_api_key(provider_name, key) {
-                                                        Ok(()) => {
-                                                            reload_ai_config = true;
-                                                            ai_mode = AiMode::ConfigApiWizard {
                                                                 step: ConfigApiStep::Done {
                                                                     message: format!("{} configured. Use /model to select.", provider),
                                                                 },
                                                             };
-                                                        }
-                                                        Err(e) => {
-                                                            ai_mode = AiMode::ConfigApiWizard {
-                                                                step: ConfigApiStep::Done {
-                                                                    message: format!("Save failed: {}", e),
-                                                                },
-                                                            };
-                                                        }
-                                                    }
+                                                }
+                                                Err(e) => {
+                                                    ai_mode = AiMode::ConfigApiWizard {
+                                                        step: ConfigApiStep::Done {
+                                                            message: format!("Save failed: {}", e),
+                                                        },
+                                                    };
                                                 }
                                             }
-                                            KeyCode::Esc => {
-                                                ai_mode = AiMode::Idle;
-                                            }
-                                            _ => {}
                                         }
                                     }
-                                    ConfigApiStep::Done { .. } => {
-                                        if code == KeyCode::Enter || code == KeyCode::Esc {
-                                            exit_wizard_to_idle = true;
-                                        }
+                                    KeyCode::Esc => {
+                                        ai_mode = AiMode::Idle;
+                                    }
+                                    _ => {}
+                                },
+                                ConfigApiStep::Done { .. } => {
+                                    if code == KeyCode::Enter || code == KeyCode::Esc {
+                                        exit_wizard_to_idle = true;
                                     }
                                 }
+                            },
+                            AiMode::Thinking => {
+                                if code == KeyCode::Esc {
+                                    ai_active_job = None;
+                                    ai_mode = AiMode::Idle;
+                                }
                             }
-                            AiMode::Thinking | AiMode::Idle => {}
+                            AiMode::Idle => {}
                         }
                         if exit_wizard_to_idle {
                             ai_mode = AiMode::Idle;
@@ -2585,21 +3304,56 @@ fn main() -> io::Result<()> {
                         continue;
                     }
 
+                    // Scrollback (Shift+PgUp / PgDn), Shift+Insert paste (bracketed)
+                    if matches!(ai_mode, AiMode::Idle) {
+                        if code == KeyCode::Insert && modifiers.contains(KeyModifiers::SHIFT) {
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                if let Ok(text) = clip.get_text() {
+                                    let _ = paste_bracketed(&mut pty_writer, &text);
+                                    viewport_scroll = 0;
+                                    screen_dirty.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            continue;
+                        }
+                        if modifiers.contains(KeyModifiers::SHIFT) {
+                            let step = screen.lock().map(|s| s.rows.max(1)).unwrap_or(24);
+                            if code == KeyCode::PageUp {
+                                viewport_scroll = viewport_scroll.saturating_add(step);
+                                screen_dirty.store(true, Ordering::Relaxed);
+                                continue;
+                            }
+                            if code == KeyCode::PageDown {
+                                viewport_scroll = viewport_scroll.saturating_sub(step);
+                                screen_dirty.store(true, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                    }
+
                     // Fish-style: Tab, Right, or End accepts full ghost; Ctrl+Right accepts one word.
                     // Match using shadow_line so accept works even when PTY echo is one frame behind.
                     let accept_full = matches!(code, KeyCode::Tab | KeyCode::Right | KeyCode::End)
                         && !modifiers.contains(KeyModifiers::CONTROL);
-                    let accept_one_word = code == KeyCode::Right && modifiers.contains(KeyModifiers::CONTROL);
+                    let accept_one_word =
+                        code == KeyCode::Right && modifiers.contains(KeyModifiers::CONTROL);
                     let shadow_cmd = command_part_of_line(shadow_line.trim());
                     let ghost_prefix_matches = ghost.as_ref().is_some_and(|g| {
                         g.for_prefix == shadow_cmd
-                            || screen.lock().map(|s| command_part_of_line(s.line_prefix_at_cursor().trim()) == g.for_prefix).unwrap_or(false)
+                            || screen
+                                .lock()
+                                .map(|s| {
+                                    command_part_of_line(s.line_prefix_at_cursor().trim())
+                                        == g.for_prefix
+                                })
+                                .unwrap_or(false)
                     });
                     if matches!(ai_mode, AiMode::Idle) && ghost_prefix_matches {
                         if accept_full {
                             if let Some(g) = ghost.take() {
                                 for c in g.suffix.chars() {
-                                    let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
+                                    let bytes =
+                                        key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
                                     for b in bytes {
                                         let _ = pty_writer.write_all(&[b]);
                                     }
@@ -2615,7 +3369,8 @@ fn main() -> io::Result<()> {
                                 let (word, rest) = split_first_word(&g.suffix);
                                 if !word.is_empty() {
                                     for c in word.chars() {
-                                        let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
+                                        let bytes =
+                                            key_to_bytes(KeyCode::Char(c), KeyModifiers::empty());
                                         for b in bytes {
                                             let _ = pty_writer.write_all(&[b]);
                                         }
@@ -2625,7 +3380,10 @@ fn main() -> io::Result<()> {
                                         ghost = None;
                                     } else {
                                         let new_prefix = format!("{}{}", g.for_prefix, word);
-                                        ghost = Some(GhostSuggestion { suffix: rest, for_prefix: new_prefix });
+                                        ghost = Some(GhostSuggestion {
+                                            suffix: rest,
+                                            for_prefix: new_prefix,
+                                        });
                                     }
                                     let _ = pty_writer.flush();
                                     screen_dirty.store(true, Ordering::Relaxed);
@@ -2644,18 +3402,26 @@ fn main() -> io::Result<()> {
                                 // Abbreviation expansion on space: "gco " -> "git checkout "
                                 if c == ' ' {
                                     let cmd_part = command_part_of_line(shadow_line.trim());
-                                    let last_word = cmd_part.split_whitespace().last().unwrap_or("");
-                                    if let Some(expansion) = expand_abbrev(last_word) {
+                                    let last_word =
+                                        cmd_part.split_whitespace().last().unwrap_or("");
+                                    if let Some(expansion) =
+                                        expand_abbrev(last_word, &*abbrev_merged.lock().unwrap())
+                                    {
                                         let n_back = last_word.chars().count();
                                         for _ in 0..n_back {
                                             shadow_line.pop();
                                         }
-                                        shadow_line.push_str(expansion);
+                                        shadow_line.push_str(&expansion);
                                         last_ghost_key = Some(Instant::now());
-                                        let cmd = command_part_of_line(shadow_line.trim()).to_string();
+                                        let cmd =
+                                            command_part_of_line(shadow_line.trim()).to_string();
                                         ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
-                                            history_suggestion(&shell_history, &cmd)
-                                            .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                            history_suggestion(&shell_history, &cmd).map(|suffix| {
+                                                GhostSuggestion {
+                                                    suffix,
+                                                    for_prefix: cmd,
+                                                }
+                                            })
                                         } else {
                                             None
                                         };
@@ -2673,8 +3439,12 @@ fn main() -> io::Result<()> {
                                 last_ghost_key = Some(Instant::now());
                                 let cmd = command_part_of_line(shadow_line.trim()).to_string();
                                 ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
-                                    history_suggestion(&shell_history, &cmd)
-                                        .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                    history_suggestion(&shell_history, &cmd).map(|suffix| {
+                                        GhostSuggestion {
+                                            suffix,
+                                            for_prefix: cmd,
+                                        }
+                                    })
                                 } else {
                                     None
                                 };
@@ -2685,8 +3455,12 @@ fn main() -> io::Result<()> {
                                 last_ghost_key = Some(Instant::now());
                                 let cmd = command_part_of_line(shadow_line.trim()).to_string();
                                 ghost = if cmd.len() >= GHOST_MIN_PREFIX_LEN {
-                                    history_suggestion(&shell_history, &cmd)
-                                        .map(|suffix| GhostSuggestion { suffix, for_prefix: cmd })
+                                    history_suggestion(&shell_history, &cmd).map(|suffix| {
+                                        GhostSuggestion {
+                                            suffix,
+                                            for_prefix: cmd,
+                                        }
+                                    })
                                 } else {
                                     None
                                 };
@@ -2697,8 +3471,12 @@ fn main() -> io::Result<()> {
                                 ghost = None;
                                 shell_history = load_shell_history();
                             }
-                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                            | KeyCode::Home | KeyCode::End => {
+                            KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Home
+                            | KeyCode::End => {
                                 shadow_line.clear();
                                 ghost = None;
                             }
@@ -2710,11 +3488,31 @@ fn main() -> io::Result<()> {
                     if matches!(ai_mode, AiMode::Idle) {
                         let is_content_key = matches!(code, KeyCode::Char(c) if !c.is_control())
                             || matches!(code, KeyCode::Backspace | KeyCode::Enter)
-                            || matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                                | KeyCode::Home | KeyCode::End);
+                            || matches!(
+                                code,
+                                KeyCode::Up
+                                    | KeyCode::Down
+                                    | KeyCode::Left
+                                    | KeyCode::Right
+                                    | KeyCode::Home
+                                    | KeyCode::End
+                            );
                         if !is_content_key {
                             shadow_line.clear();
                             ghost = None;
+                        }
+                    }
+
+                    // Dismiss welcome banner on first line submit so the shell uses the full terminal.
+                    if matches!(ai_mode, AiMode::Idle) && banner_height > 0 {
+                        let submit_line = matches!(code, KeyCode::Enter)
+                            || matches!(code, KeyCode::Char('\n' | '\r'));
+                        if submit_line {
+                            banner_height = 0;
+                            if let Ok((cols, rows)) = terminal::size() {
+                                sync_pty_with_banner(&*master, &screen, 0, cols, rows);
+                            }
+                            screen_dirty.store(true, Ordering::Relaxed);
                         }
                     }
 
@@ -2725,8 +3523,8 @@ fn main() -> io::Result<()> {
                     let _ = pty_writer.flush();
                 }
                 Ok(Event::Mouse(me)) => {
-                    // Terminal row 0..art_height is the banner; grid starts at art_height
-                    let row = me.row.saturating_sub(art_height as u16) as usize;
+                    // Terminal row 0..banner_height is the banner; grid starts below it.
+                    let row = me.row.saturating_sub(banner_height as u16) as usize;
                     let col = me.column as usize;
                     match me.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -2739,8 +3537,10 @@ fn main() -> io::Result<()> {
                                 let now = Instant::now();
                                 let click_count = match last_click {
                                     Some((lr, lc, n, t))
-                                        if lr == r && lc == c
-                                            && now.duration_since(t).as_millis() < DOUBLE_CLICK_MS as u128 =>
+                                        if lr == r
+                                            && lc == c
+                                            && now.duration_since(t).as_millis()
+                                                < DOUBLE_CLICK_MS as u128 =>
                                     {
                                         (n + 1).min(3)
                                     }
@@ -2801,24 +3601,24 @@ fn main() -> io::Result<()> {
                             }
                             selecting = false;
                         }
+                        MouseEventKind::Down(MouseButton::Middle) => {
+                            if matches!(ai_mode, AiMode::Idle) {
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    if let Ok(text) = clip.get_text() {
+                                        let _ = paste_bracketed(&mut pty_writer, &text);
+                                        viewport_scroll = 0;
+                                        screen_dirty.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
                 Ok(Event::Resize(c, r)) => {
                     screen_dirty.store(true, Ordering::Relaxed);
-                    let new_term_rows = r as usize;
-                    let new_term_cols = c as usize;
-                    let new_rows = new_term_rows.saturating_sub(art_height).max(1);
-                    let new_cols = new_term_cols;
-                    let _ = master.resize(PtySize {
-                        rows: new_rows as u16,
-                        cols: c,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                    if let Ok(mut s) = screen.lock() {
-                        s.resize(new_rows, new_cols);
-                    }
+                    viewport_scroll = 0;
+                    sync_pty_with_banner(&*master, &screen, banner_height, c, r);
                     selection = None;
                 }
                 _ => {}
@@ -2827,43 +3627,57 @@ fn main() -> io::Result<()> {
 
         // When Thinking, poll for worker result even without a key event
         if matches!(ai_mode, AiMode::Thinking) {
-            if let Ok(res) = ai_rx.try_recv() {
-                ai_mode = match res {
-                    Ok(cmd) => AiMode::SuggestionReady { command: cmd },
-                    Err(e) => AiMode::Error { message: e },
-                };
-                screen_dirty.store(true, Ordering::Relaxed);
+            if let Ok((jid, res)) = ai_rx.try_recv() {
+                if ai_active_job == Some(jid) {
+                    ai_active_job = None;
+                    ai_mode = match res {
+                        Ok(cmd) => ai_suggestion_ready(cmd),
+                        Err(e) => AiMode::Error { message: e },
+                    };
+                    screen_dirty.store(true, Ordering::Relaxed);
+                }
             }
         }
 
         // Ghost completion: poll for AI result; only apply if prefix still matches (user may have typed more)
-        if let Ok((suffix, for_prefix)) = ghost_rx.try_recv() {
-            ghost_pending = false;
-            let current_cmd = command_part_of_line(shadow_line.trim()).to_string();
-            if current_cmd == for_prefix && !suffix.is_empty() {
-                ghost = Some(GhostSuggestion { suffix, for_prefix });
-                screen_dirty.store(true, Ordering::Relaxed);
+        if let Ok((gen, suffix, for_prefix)) = ghost_rx.try_recv() {
+            if gen == ghost_request_gen {
+                ghost_pending = false;
+                let current_cmd = command_part_of_line(shadow_line.trim()).to_string();
+                if current_cmd == for_prefix && !suffix.is_empty() {
+                    ghost = Some(GhostSuggestion { suffix, for_prefix });
+                    screen_dirty.store(true, Ordering::Relaxed);
+                }
             }
         }
         // AI fallback when no history match: debounced so we don't call API on every key
         if matches!(ai_mode, AiMode::Idle)
             && !ghost_pending
             && ghost.is_none()
-            && last_ghost_key.map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS)).unwrap_or(false)
+            && last_ghost_key
+                .map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS))
+                .unwrap_or(false)
         {
-            let prefix = screen.lock().map(|s| s.line_prefix_at_cursor()).unwrap_or_default();
+            let prefix = screen
+                .lock()
+                .map(|s| s.line_prefix_at_cursor())
+                .unwrap_or_default();
             let prefix = prefix.trim().to_string();
             let command_part = command_part_of_line(&prefix);
             if command_part.len() >= GHOST_AI_MIN_PREFIX_LEN {
                 ghost_pending = true;
                 last_ghost_key = Some(Instant::now());
-                    let backend = backend_override.unwrap_or(ai_config.default_backend);
-                    let config = ai_config.clone();
-                    let model_opt = model_override.clone().or_else(|| config.default_model.clone());
-                    let ghost_tx = ghost_tx.clone();
-                    let for_prefix = prefix.clone();
-                    let command_part = command_part.to_string();
-                    thread::spawn(move || {
+                ghost_request_gen = ghost_request_gen.wrapping_add(1);
+                let gen = ghost_request_gen;
+                let backend = backend_override.unwrap_or(ai_config.default_backend);
+                let config = ai_config.clone();
+                let model_opt = model_override
+                    .clone()
+                    .or_else(|| config.default_model.clone());
+                let ghost_tx = ghost_tx.clone();
+                let for_prefix = prefix.clone();
+                let command_part = command_part.to_string();
+                thread::spawn(move || {
                     let reply = match backend {
                         AiBackend::Ollama => {
                             let model = match ollama_resolve_model(
@@ -2898,7 +3712,8 @@ fn main() -> io::Result<()> {
                                 Some(k) => k,
                                 None => return,
                             };
-                            let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                            let model =
+                                model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
                             let base = config.groq_base_url();
                             openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
                         }
@@ -2908,30 +3723,38 @@ fn main() -> io::Result<()> {
                         Err(_) => return,
                     };
                     if !suffix.is_empty() {
-                        let _ = ghost_tx.send((suffix, command_part));
+                        let _ = ghost_tx.send((gen, suffix, command_part));
                     }
                 });
             }
         }
 
         // AI bar ghost: poll result and debounced completion request
-        if let Ok((suffix, for_prefix)) = ai_bar_ghost_rx.try_recv() {
-            ai_bar_ghost = Some(GhostSuggestion { suffix, for_prefix });
-            ai_bar_ghost_pending = false;
-            screen_dirty.store(true, Ordering::Relaxed);
+        if let Ok((gen, suffix, for_prefix)) = ai_bar_ghost_rx.try_recv() {
+            if gen == ai_bar_ghost_request_gen {
+                ai_bar_ghost = Some(GhostSuggestion { suffix, for_prefix });
+                ai_bar_ghost_pending = false;
+                screen_dirty.store(true, Ordering::Relaxed);
+            }
         }
         if let AiMode::PromptInput { ref buffer } = ai_mode {
             if !ai_bar_ghost_pending
-                && last_ai_bar_ghost_key.map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS)).unwrap_or(false)
+                && last_ai_bar_ghost_key
+                    .map(|t| t.elapsed() >= Duration::from_millis(GHOST_AI_DEBOUNCE_MS))
+                    .unwrap_or(false)
                 && buffer.trim().len() >= GHOST_MIN_PREFIX_LEN
             {
                 ai_bar_ghost_pending = true;
                 last_ai_bar_ghost_key = Some(Instant::now());
+                ai_bar_ghost_request_gen = ai_bar_ghost_request_gen.wrapping_add(1);
+                let gen = ai_bar_ghost_request_gen;
                 let for_prefix = buffer.trim().to_string();
                 let command_part = command_part_of_line(&for_prefix).to_string();
                 let backend = backend_override.unwrap_or(ai_config.default_backend);
                 let config = ai_config.clone();
-                let model_opt = model_override.clone().or_else(|| config.default_model.clone());
+                let model_opt = model_override
+                    .clone()
+                    .or_else(|| config.default_model.clone());
                 let ai_bar_ghost_tx = ai_bar_ghost_tx.clone();
                 thread::spawn(move || {
                     let reply = match backend {
@@ -2968,7 +3791,8 @@ fn main() -> io::Result<()> {
                                 Some(k) => k,
                                 None => return,
                             };
-                            let model = model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
+                            let model =
+                                model_opt.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
                             let base = config.groq_base_url();
                             openai_generate(&base, &api_key, &model, COMPLETE_SYSTEM, &command_part)
                         }
@@ -2978,7 +3802,7 @@ fn main() -> io::Result<()> {
                         Err(_) => return,
                     };
                     if !suffix.is_empty() {
-                        let _ = ai_bar_ghost_tx.send((suffix, for_prefix));
+                        let _ = ai_bar_ghost_tx.send((gen, suffix, for_prefix));
                     }
                 });
             }
@@ -3003,12 +3827,13 @@ fn main() -> io::Result<()> {
                 let _ = render(
                     &s,
                     selection.as_ref(),
-                    art_height,
+                    banner_height,
                     &*t,
-                    false,
+                    !matches!(ai_mode, AiMode::Idle),
                     current_model,
                     ghost.as_ref(),
                     input_cmd_prefix,
+                    viewport_scroll,
                     &mut stdout,
                 );
             }
@@ -3017,13 +3842,23 @@ fn main() -> io::Result<()> {
                     .map(|(c, r)| (r as usize, c as usize))
                     .unwrap_or((24, 80));
                 if let Ok(t) = theme.lock() {
-                    let _ = render_ai_bar(&ai_mode, term_rows, term_cols, &*t, current_model, ai_bar_ghost.as_ref(), &mut stdout);
+                    let _ = render_ai_bar(
+                        &ai_mode,
+                        term_rows,
+                        term_cols,
+                        &*t,
+                        current_model,
+                        ai_bar_ghost.as_ref(),
+                        &mut stdout,
+                    );
                 }
             }
         }
     }
 
     running.store(false, Ordering::Relaxed);
+    let _ = pty_writer.write_all(b"\x1b[?2004l");
+    let _ = pty_writer.flush();
     let _ = reader_handle.join();
 
     execute!(
